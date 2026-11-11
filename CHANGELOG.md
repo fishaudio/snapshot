@@ -42,6 +42,13 @@ commit-level history for each release is on its
   annotation from its manifest. Existing restore Pods are unchanged; upgrade the
   node agent before creating such Pods. See
   [Restore from several PodSnapshots](docs/reference/restore-pod-contract.md#restore-from-several-podsnapshots).
+- `config.criu.compress` stores memory pages LZ4-compressed when a snapshot is
+  taken, and `config.criu.decompressThreads` restores compressed and all-zero
+  pages on several workers. Both are off by default. The agent image now builds
+  CRIU with LZ4; the agent reports support at startup and fails a checkpoint
+  that asks for compression without it. A compressed snapshot needs an agent
+  with this CRIU to restore. See
+  [Agent config](docs/reference/api.md#agent-config-config).
 
 - Lifecycle hooks: `PodSnapshot.spec.containers` and
   `SnapshotJob.spec.podSnapshotTemplate.containers` can set a

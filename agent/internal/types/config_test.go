@@ -138,3 +138,59 @@ func TestTimeoutsAcceptTheLargestRepresentableValue(t *testing.T) {
 	restore := RestoreSpec{TimeoutSeconds: limit}
 	require.NoError(t, restore.Validate())
 }
+
+// A ConfigMap that predates the compression keys leaves them unset, so the
+// agent keeps CRIU's own defaults.
+func TestCRIUCompressionSettingsParse(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		cfg := &AgentConfig{}
+		require.NoError(t, yaml.Unmarshal([]byte("criu:\n  imageIoMode: direct\n"), cfg))
+
+		assert.False(t, cfg.CRIU.Compress)
+		assert.Zero(t, cfg.CRIU.CompressBlockBytes)
+		assert.Nil(t, cfg.CRIU.DecompressThreads)
+	})
+
+	t.Run("set", func(t *testing.T) {
+		cfg := &AgentConfig{}
+		document := "criu:\n  compress: true\n  compressBlockBytes: 1048576\n  decompressThreads: 0\n"
+		require.NoError(t, yaml.Unmarshal([]byte(document), cfg))
+
+		assert.True(t, cfg.CRIU.Compress)
+		assert.Equal(t, uint32(1048576), cfg.CRIU.CompressBlockBytes)
+		require.NotNil(t, cfg.CRIU.DecompressThreads, "0 asks CRIU to choose, unlike an absent key")
+		assert.Equal(t, 0, *cfg.CRIU.DecompressThreads)
+	})
+}
+
+func TestAgentConfigValidateCompressionSettings(t *testing.T) {
+	threads := func(n int) *int { return &n }
+	for name, tc := range map[string]struct {
+		criu    CRIUSettings
+		wantErr string
+	}{
+		"defaults":                         {},
+		"compression":                      {criu: CRIUSettings{Compress: true, CompressBlockBytes: 65536}},
+		"CRIU chooses the restore workers": {criu: CRIUSettings{DecompressThreads: threads(0)}},
+		"the most restore workers":         {criu: CRIUSettings{DecompressThreads: threads(MaxDecompressThreads)}},
+		"a block size without compression": {criu: CRIUSettings{CompressBlockBytes: 65536}, wantErr: "criu.compressBlockBytes"},
+		"negative restore workers":         {criu: CRIUSettings{DecompressThreads: threads(-1)}, wantErr: "criu.decompressThreads"},
+		"too many restore workers": {
+			criu:    CRIUSettings{DecompressThreads: threads(MaxDecompressThreads + 1)},
+			wantErr: "criu.decompressThreads",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validAgentConfig()
+			cfg.CRIU = tc.criu
+
+			err := cfg.Validate()
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}

@@ -87,3 +87,42 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: 'restoreMode: "staged"'
+
+  - it: leaves memory page compression off and restore decoding serial by default
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'compress: false\n  compressBlockBytes: 0\n  decompressThreads: 1\n'
+
+  - it: renders memory page compression and the restore workers
+    set:
+      config.criu.compress: true
+      config.criu.compressBlockBytes: 1048576
+      config.criu.decompressThreads: 8
+    asserts:
+      # A large integer must not render in exponent form.
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'compress: true\n  compressBlockBytes: 1048576\n  decompressThreads: 8\n'
+
+  - it: lets CRIU choose the restore workers
+    set:
+      config.criu.decompressThreads: 0
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'decompressThreads: 0\n'
+
+  - it: rejects more restore workers than CRIU accepts
+    set:
+      config.criu.decompressThreads: 1025
+    asserts:
+      - failedTemplate:
+          errorPattern: "decompressThreads"
+
+  - it: rejects a compression block size that is not a whole number of bytes
+    set:
+      config.criu.compressBlockBytes: 1.5
+    asserts:
+      - failedTemplate:
+          errorPattern: "compressBlockBytes"

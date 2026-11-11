@@ -1327,6 +1327,7 @@ func (op *restoreOperation) executeRestore(ctx context.Context) (executor.Restor
 		PageBrokerControlSocketPath: w.config.PageBroker.ControlSocketPath,
 		PageBrokerRestoreMode:       w.config.PageBroker.RestoreMode,
 		PublishedArtifact:           op.artifact.PublishedArtifact,
+		DecompressThreads:           w.config.CRIU.DecompressThreads,
 	}
 	return w.restoreFn(ctx, w.runtime, op.log, req, w.injector)
 }

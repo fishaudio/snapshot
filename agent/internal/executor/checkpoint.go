@@ -33,6 +33,12 @@ import (
 
 const pageBrokerAbortTimeout = 30 * time.Second
 
+// errCompressionUnsupported refuses a checkpoint that asks for page
+// compression on a node whose CRIU cannot provide it.
+var errCompressionUnsupported = errors.New("config.criu.compress is set, but this node's CRIU cannot compress memory pages: " +
+	"it was built without LZ4, or the agent could not check it at startup (see the agent log). " +
+	"Turn config.criu.compress off, or deploy an agent image whose CRIU has LZ4")
+
 // cleanupFailure marks a failure from releasing a transaction, as opposed to the
 // capture failure it is reported alongside. The two travel joined, so without a
 // mark a classifier can only tell them apart by the order they were joined in.
@@ -143,6 +149,12 @@ func checkpoint(ctx context.Context, rt snapshotruntime.Runtime, log logr.Logger
 	ctx = logr.NewContext(ctx, log)
 	checkpointStart := time.Now()
 	log.Info("=== Starting checkpoint operation ===")
+
+	// A CRIU that cannot compress would write the snapshot uncompressed
+	// without saying so. Refuse before the source is touched.
+	if cfg.CRIU.Compress && !cfg.CRIUMemCompression {
+		return nil, failStep(StepConfigureCheckpoint, errCompressionUnsupported)
+	}
 
 	bound := req.StoreID != ""
 	var target *pagebroker.ArtifactTarget

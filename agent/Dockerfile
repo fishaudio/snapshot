@@ -210,6 +210,8 @@ ARG CRIU_REPO
 ARG CRIU_REF
 ARG BUILD_JOBS=4
 
+# liblz4-dev gives CRIU memory page compression (config.criu.compress). CRIU
+# builds without it when it is missing, and then reports the feature missing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
@@ -220,6 +222,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnet1-dev \
     libnl-3-dev \
     libnl-route-3-dev \
+    liblz4-dev \
     libprotobuf-dev \
     libprotobuf-c-dev \
     protobuf-c-compiler \
@@ -270,6 +273,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnet1 \
     libnl-3-200 \
     libnl-route-3-200 \
+    liblz4-1 \
     libprotobuf32t64 \
     libprotobuf-c1 \
     libgnutls30t64 \

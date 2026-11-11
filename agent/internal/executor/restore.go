@@ -139,6 +139,9 @@ type RestoreRequest struct {
 	// WithoutProxy restores into a container whose PID 1 is its own command,
 	// on a node without the restore proxy. Otherwise PID 1 must be the proxy.
 	WithoutProxy bool
+	// DecompressThreads is how many workers CRIU decodes compressed and zero
+	// pages with, from this agent's config. Nil keeps CRIU's default, 1.
+	DecompressThreads *int
 }
 
 // RestoreResult identifies the processes a successful restore leaves behind.
@@ -703,14 +706,9 @@ func existingMountPaths(targetRoot string, destinations []string, aliases map[st
 	return existing
 }
 
-func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, snap *types.RestoreContainerSnapshot, mp nsmount.MountPoint, checkpointPath string, gpu *pagebroker.CustomStorageExecution) (*RestoreInNamespaceResult, error) {
-
-	cmd, closeFiles, err := snapshotruntime.CommandInNamespaces(ctx, snap.PlaceholderPID, mp.NsFd(),
-		snap.TargetRoot, filepath.Join(nsmount.SnapshotBinSrc, "nsrestore"))
-	if err != nil {
-		return nil, err
-	}
-	defer closeFiles()
+// nsrestoreArgs returns the flags nsrestore restores the checkpoint at
+// checkpointPath with.
+func nsrestoreArgs(req RestoreRequest, snap *types.RestoreContainerSnapshot, checkpointPath string) ([]string, error) {
 	args := []string{"--checkpoint-path", checkpointPath, "--bundle-dir", nsmount.SnapshotBinDst}
 
 	if snap.CUDADeviceMap != "" {
@@ -731,6 +729,25 @@ func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, sna
 	}
 	if req.TargetPodIP != "" {
 		args = append(args, "--target-pod-ip", req.TargetPodIP)
+	}
+	// nsrestore defaults to 1, CRIU's own default.
+	if threads := req.DecompressThreads; threads != nil && *threads != 1 {
+		args = append(args, "--decompress-threads", strconv.Itoa(*threads))
+	}
+	return args, nil
+}
+
+func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, snap *types.RestoreContainerSnapshot, mp nsmount.MountPoint, checkpointPath string, gpu *pagebroker.CustomStorageExecution) (*RestoreInNamespaceResult, error) {
+
+	cmd, closeFiles, err := snapshotruntime.CommandInNamespaces(ctx, snap.PlaceholderPID, mp.NsFd(),
+		snap.TargetRoot, filepath.Join(nsmount.SnapshotBinSrc, "nsrestore"))
+	if err != nil {
+		return nil, err
+	}
+	defer closeFiles()
+	args, err := nsrestoreArgs(req, snap, checkpointPath)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd.Args = append(cmd.Args, args...)

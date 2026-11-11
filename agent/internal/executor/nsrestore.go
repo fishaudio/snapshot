@@ -38,6 +38,8 @@ type RestoreOptions struct {
 	TargetPodIP            string
 	// BundleDir is the path where the agent's binary bundle is mounted inside this namespace.
 	BundleDir string
+	// DecompressThreads is the restoring agent's config.criu.decompressThreads.
+	DecompressThreads int
 }
 
 type RestoreInNamespaceResult struct {
@@ -112,6 +114,7 @@ func RestoreInNamespace(ctx context.Context, opts RestoreOptions, log logr.Logge
 	if err != nil {
 		return nil, failStep(StepPrepareCRIURestore, err)
 	}
+	criu.SetDecompressThreads(criuOpts, opts.DecompressThreads)
 
 	executeTimings, restoredPID, cleanupErr, err := executeRestore(ctx, criuOpts, m, opts, cudaJobFile, log)
 	if err != nil {

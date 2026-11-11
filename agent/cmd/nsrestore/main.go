@@ -19,6 +19,7 @@ import (
 	"github.com/ai-dynamo/snapshot/agent/internal/executor"
 	"github.com/ai-dynamo/snapshot/agent/internal/logging"
 	"github.com/ai-dynamo/snapshot/agent/internal/nsmount"
+	"github.com/ai-dynamo/snapshot/agent/internal/types"
 )
 
 func main() {
@@ -40,11 +41,15 @@ func main() {
 	cgroupRoot := flag.String("cgroup-root", "", "CRIU cgroup root remap path")
 	lsmProfile := flag.String("lsm-profile", "", "CRIU lsm_profile for the restored processes")
 	targetPodIP := flag.String("target-pod-ip", "", "Restore pod IP for CRIU TCP socket remapping")
+	decompressThreads := flag.Int("decompress-threads", 1, "CRIU workers for compressed and zero pages; 0 lets CRIU choose")
 	bundleDir := flag.String("bundle-dir", nsmount.SnapshotBinDst, "Path where the agent binary bundle is mounted in this namespace")
 	flag.Parse()
 
 	if *checkpointPath == "" {
 		fatal(log, nil, "--checkpoint-path is required")
+	}
+	if *decompressThreads < 0 || *decompressThreads > types.MaxDecompressThreads {
+		fatal(log, nil, fmt.Sprintf("--decompress-threads must be between 0 and %d", types.MaxDecompressThreads))
 	}
 
 	if err := useInjectedBundle(*bundleDir); err != nil {
@@ -52,12 +57,13 @@ func main() {
 	}
 
 	opts := executor.RestoreOptions{
-		CheckpointPath: *checkpointPath,
-		CUDADeviceMap:  *cudaDeviceMap,
-		CgroupRoot:     *cgroupRoot,
-		LSMProfile:     *lsmProfile,
-		TargetPodIP:    *targetPodIP,
-		BundleDir:      *bundleDir,
+		CheckpointPath:    *checkpointPath,
+		CUDADeviceMap:     *cudaDeviceMap,
+		CgroupRoot:        *cgroupRoot,
+		LSMProfile:        *lsmProfile,
+		TargetPodIP:       *targetPodIP,
+		BundleDir:         *bundleDir,
+		DecompressThreads: *decompressThreads,
 	}
 
 	var err error
