@@ -335,28 +335,43 @@ payload checksums.
 
 `config.criu.*` — CRIU options:
 
-| Value               | Default                                | Description                                                                              |
-|---------------------|----------------------------------------|------------------------------------------------------------------------------------------|
-| `binaryPath`        | `/usr/local/sbin/criu`                 | Path to the criu binary.                                                                 |
-| `ghostLimit`        | `536870912`                            | Max size in bytes of a deleted-but-open file saved inline as a ghost file.               |
-| `logLevel`          | `4`                                    | CRIU verbosity (0–4).                                                                    |
-| `workDir`           | `/var/criu-work`                       | CRIU temporary-file directory.                                                           |
-| `shellJob`          | `true`                                 | Treat containers as session leaders.                                                     |
-| `tcpClose`          | `false`                                | Close non-listening TCP sockets on restore.                                              |
-| `tcpEstablished`    | `true`                                 | Preserve established TCP sockets. `tcpClose` and `tcpEstablished` cannot both be `true`. |
-| `fileLocks`         | `true`                                 | Preserve file locks.                                                                     |
-| `orphanPtsMaster`   | `true`                                 | Support containers with TTYs.                                                            |
-| `extUnixSk`         | `true`                                 | External Unix sockets.                                                                   |
-| `linkRemap`         | `true`                                 | Support deleted-but-open files (e.g. `/dev/shm` semaphores).                             |
-| `extMasters`        | `true`                                 | External bind-mount masters.                                                             |
-| `manageCgroupsMode` | `soft`                                 | CRIU cgroup mode: `ignore` / `soft` / `full` / `strict`.                                 |
-| `imageIoMode`       | `direct`                               | CRIU image I/O: `writeback` or `direct`.                                                 |
-| `rstSibling`        | `true`                                 | Restore as a sibling process (required for go-criu swrk mode).                           |
-| `mntnsCompatMode`   | `false`                                | Mount-namespace compatibility mode, applied during restore.                              |
-| `evasiveDevices`    | `true`                                 | Use any device path when the original is inaccessible.                                   |
-| `forceIrmap`        | `true`                                 | Force resolving inotify/fsnotify watch names.                                            |
-| `autoDedup`         | `false`                                | Auto-deduplicate memory pages.                                                           |
-| `lazyPages`         | `false`                                | Lazy page migration (experimental).                                                      |
-| `libDir`            | `/usr/local/lib/snapshot/criu-plugins` | CRIU plugin directory used by the chart.                                                 |
-| `allowUprobes`      | `true`                                 | Kernel/userspace probe compatibility.                                                    |
-| `skipInFlight`      | `true`                                 | Skip in-flight TCP connections.                                                          |
+| Value                | Default                                | Description                                                                              |
+|----------------------|----------------------------------------|------------------------------------------------------------------------------------------|
+| `binaryPath`         | `/usr/local/sbin/criu`                 | Path to the criu binary.                                                                 |
+| `ghostLimit`         | `536870912`                            | Max size in bytes of a deleted-but-open file saved inline as a ghost file.               |
+| `logLevel`           | `4`                                    | CRIU verbosity (0–4).                                                                    |
+| `workDir`            | `/var/criu-work`                       | CRIU temporary-file directory.                                                           |
+| `shellJob`           | `true`                                 | Treat containers as session leaders.                                                     |
+| `tcpClose`           | `false`                                | Close non-listening TCP sockets on restore.                                              |
+| `tcpEstablished`     | `true`                                 | Preserve established TCP sockets. `tcpClose` and `tcpEstablished` cannot both be `true`. |
+| `fileLocks`          | `true`                                 | Preserve file locks.                                                                     |
+| `orphanPtsMaster`    | `true`                                 | Support containers with TTYs.                                                            |
+| `extUnixSk`          | `true`                                 | External Unix sockets.                                                                   |
+| `linkRemap`          | `true`                                 | Support deleted-but-open files (e.g. `/dev/shm` semaphores).                             |
+| `extMasters`         | `true`                                 | External bind-mount masters.                                                             |
+| `manageCgroupsMode`  | `soft`                                 | CRIU cgroup mode: `ignore` / `soft` / `full` / `strict`.                                 |
+| `imageIoMode`        | `direct`                               | CRIU image I/O: `writeback` or `direct`.                                                 |
+| `rstSibling`         | `true`                                 | Restore as a sibling process (required for go-criu swrk mode).                           |
+| `mntnsCompatMode`    | `false`                                | Mount-namespace compatibility mode, applied during restore.                              |
+| `evasiveDevices`     | `true`                                 | Use any device path when the original is inaccessible.                                   |
+| `forceIrmap`         | `true`                                 | Force resolving inotify/fsnotify watch names.                                            |
+| `autoDedup`          | `false`                                | Auto-deduplicate memory pages.                                                           |
+| `lazyPages`          | `false`                                | Lazy page migration (experimental).                                                      |
+| `compress`           | `false`                                | Store memory pages LZ4-compressed when a snapshot is taken; see below.                   |
+| `compressBlockBytes` | `0`                                    | Compression block size in bytes; `0` keeps CRIU's default. Needs `compress`.             |
+| `decompressThreads`  | `1`                                    | Restore workers for compressed and zero pages: `0` lets CRIU choose, `1` is serial.      |
+| `libDir`             | `/usr/local/lib/snapshot/criu-plugins` | CRIU plugin directory used by the chart.                                                 |
+| `allowUprobes`       | `true`                                 | Kernel/userspace probe compatibility.                                                    |
+| `skipInFlight`       | `true`                                 | Skip in-flight TCP connections.                                                          |
+
+With `compress`, CRIU stores memory in LZ4 blocks when a snapshot is taken,
+which costs CPU during the checkpoint. An all-zero block takes no space, and a
+block that does not compress, such as most model weights, is stored raw. A
+restore reads such a snapshot without any setting. With `decompressThreads`
+other than `1`, it decodes compressed blocks and fills zero blocks on several
+workers, while raw blocks keep the single-threaded read path. The restoring
+node's `decompressThreads` applies, including to snapshots taken before it
+changed. Compression needs a CRIU built with LZ4, as in the agent image. The
+agent logs `criu_mem_compression` at startup and fails a checkpoint that asks
+for compression where it is `false`. A compressed snapshot restores only on an
+agent whose CRIU supports compression.

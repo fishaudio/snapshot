@@ -371,6 +371,19 @@ config:
     autoDedup: false        # Auto-deduplication of memory pages
     lazyPages: false        # Lazy page migration (experimental)
 
+    # Memory page compression (LZ4). compress costs CPU when the snapshot is
+    # taken. All-zero pages take no space and, like pages that compress,
+    # restore in parallel with decompressThreads workers. Pages that do not
+    # compress, such as model weights, are stored raw and restore on the
+    # single-threaded path. The agent refuses a checkpoint that asks for
+    # compression when its CRIU was built without it.
+    compress: false          # Compress memory pages when a snapshot is taken
+    compressBlockBytes: 0    # Compression block size in bytes; 0 keeps CRIU's default. Needs compress
+    # Restore workers for compressed and zero pages: 0 lets CRIU choose, 1
+    # decodes serially (CRIU's default). Read by the agent that restores, so
+    # it also applies to snapshots taken before it changed.
+    decompressThreads: 1
+
     # Config file options (NOT available via RPC - written to criu.conf)
     # Dedicated directory for the CRIU plugins used by this chart.
     # Do not point this at CRIU's global plugin dir, which can load unrelated

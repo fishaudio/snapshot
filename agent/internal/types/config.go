@@ -28,6 +28,9 @@ type AgentConfig struct {
 	Checkpoint             CheckpointSpec  `yaml:"checkpoint"`
 	Restore                RestoreSpec     `yaml:"restore"`
 	CRIU                   CRIUSettings    `yaml:"criu"`
+	// CRIUMemCompression reports that the node's CRIU can compress memory
+	// pages, as its feature check said at startup.
+	CRIUMemCompression bool `yaml:"-"`
 }
 
 func (c *AgentConfig) LoadEnvOverrides() {
@@ -72,6 +75,15 @@ func (c *AgentConfig) Validate() error {
 		return &ConfigError{
 			Field:   "criu.imageIoMode",
 			Message: fmt.Sprintf("unsupported imageIoMode %q; expected %q, %q, or empty", c.CRIU.ImageIoMode, "writeback", "direct"),
+		}
+	}
+	if c.CRIU.CompressBlockBytes != 0 && !c.CRIU.Compress {
+		return &ConfigError{Field: "criu.compressBlockBytes", Message: "criu.compressBlockBytes needs criu.compress"}
+	}
+	if threads := c.CRIU.DecompressThreads; threads != nil && (*threads < 0 || *threads > MaxDecompressThreads) {
+		return &ConfigError{
+			Field:   "criu.decompressThreads",
+			Message: fmt.Sprintf("criu.decompressThreads must be between 0 and %d", MaxDecompressThreads),
 		}
 	}
 	if err := c.Checkpoint.Validate(); err != nil {
@@ -193,7 +205,23 @@ type CRIUSettings struct {
 	LibDir            string `yaml:"libDir"`
 	AllowUprobes      bool   `yaml:"allowUprobes"`
 	SkipInFlight      bool   `yaml:"skipInFlight"`
+	// Compress has the dump store memory pages in LZ4-compressed blocks.
+	// All-zero blocks take no space, and blocks that do not compress are
+	// stored raw. A restore needs no setting to read them.
+	Compress bool `yaml:"compress"`
+	// CompressBlockBytes is the size of a compression block; zero keeps
+	// CRIU's default. It needs Compress.
+	CompressBlockBytes uint32 `yaml:"compressBlockBytes"`
+	// DecompressThreads bounds the workers a restore decodes compressed
+	// blocks and large zero runs with: 0 lets CRIU choose, 1 decodes them
+	// serially. The restoring agent's value applies, not the one a snapshot
+	// was taken with. Unset keeps CRIU's default, 1.
+	DecompressThreads *int `yaml:"decompressThreads"`
 }
+
+// MaxDecompressThreads is the largest worker count CRIU accepts for
+// decompress_threads.
+const MaxDecompressThreads = 1024
 
 // OverlaySettings is the static config for rootfs exclusions.
 type OverlaySettings struct {

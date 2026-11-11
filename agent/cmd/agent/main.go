@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ai-dynamo/snapshot/agent/internal/controller"
+	"github.com/ai-dynamo/snapshot/agent/internal/criu"
 	"github.com/ai-dynamo/snapshot/agent/internal/logging"
 	"github.com/ai-dynamo/snapshot/agent/internal/nri"
 	"github.com/ai-dynamo/snapshot/agent/internal/pagebroker"
@@ -55,6 +56,13 @@ func main() {
 	} else {
 		cfg.HostCPUFeatures = cpuFeatures
 	}
+	// CRIU compresses memory pages only when it was built with LZ4. Without
+	// it, a checkpoint that asks for compression is refused.
+	if supported, err := criu.MemCompressionSupported(cfg.CRIU.BinaryPath); err != nil {
+		agentLog.Error(err, "Failed to check CRIU for memory page compression; checkpoints that ask for it will fail")
+	} else {
+		cfg.CRIUMemCompression = supported
+	}
 
 	rt, err := snapshotruntime.New(*runtimeType, *runtimeSocket)
 	if err != nil {
@@ -80,6 +88,7 @@ func main() {
 	agentLog.Info("Starting snapshot agent",
 		"node", cfg.NodeName,
 		"runtime", *runtimeType,
+		"criu_mem_compression", cfg.CRIUMemCompression,
 	)
 
 	// The node controller handles both restore and capture paths.

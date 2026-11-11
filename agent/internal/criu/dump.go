@@ -81,6 +81,7 @@ func BuildDumpOptions(
 	if settings.GhostLimit > 0 {
 		criuOpts.GhostLimit = proto.Uint32(settings.GhostLimit)
 	}
+	applyCompression(criuOpts, settings)
 
 	// Write criu.conf for options that cannot be passed via RPC.
 	if confContent := buildCRIUConf(settings); confContent != "" {

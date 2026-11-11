@@ -122,6 +122,9 @@ data:
       forceIrmap: {{ .Values.config.criu.forceIrmap }}
       autoDedup: {{ .Values.config.criu.autoDedup }}
       lazyPages: {{ .Values.config.criu.lazyPages }}
+      compress: {{ .Values.config.criu.compress }}
+      compressBlockBytes: {{ .Values.config.criu.compressBlockBytes | int64 }}
+      decompressThreads: {{ .Values.config.criu.decompressThreads | int64 }}
       libDir: {{ .Values.config.criu.libDir | quote }}
       allowUprobes: {{ .Values.config.criu.allowUprobes }}
       skipInFlight: {{ .Values.config.criu.skipInFlight }}
