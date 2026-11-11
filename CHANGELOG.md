@@ -74,6 +74,11 @@ commit-level history for each release is on its
   `example.com/pool DoesNotExist` keeps the agent off those nodes. An install
   that sets none is unchanged. See
   [Agent DaemonSet and Access](docs/reference/helm-values.md#agent-daemonset-and-access).
+- `daemonset.restoreProxy.enabled: false` leaves the NRI socket out of the node
+  agent, so the container runtime does not call the agent for each container
+  it creates. Restores then run without the restore proxy, and restore Pods
+  need an inert command. Default `true`, unchanged. See
+  [Nodes Without the Restore Proxy](docs/reference/restore-pod-contract.md#nodes-without-the-restore-proxy).
 
 ### Changed
 
