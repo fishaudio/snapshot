@@ -5,13 +5,22 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"math"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/testr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	clientgotesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/ai-dynamo/snapshot/agent/internal/executor"
 	snapshotruntime "github.com/ai-dynamo/snapshot/agent/internal/runtime"
@@ -176,4 +185,172 @@ func TestPreflightRestoreFromMapUsesTheSandboxIPForEveryDestination(t *testing.T
 
 	assert.False(t, requeue)
 	assert.Equal(t, []string{"10.0.0.7", "10.0.0.7"}, *targets)
+}
+
+// sandboxReadyAfter is a runtime whose Pod sandbox has its IP only after
+// failures lookups, as when a pass runs while the sandbox's network is being
+// set up.
+type sandboxReadyAfter struct {
+	*fakeRuntime
+	failures int
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *sandboxReadyAfter) ResolvePodSandboxIPs(context.Context, string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.calls <= r.failures {
+		return nil, errors.New("pod has no ready sandbox")
+	}
+	return []string{"10.0.0.7"}, nil
+}
+
+func (r *sandboxReadyAfter) lookups() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// waitingTCPRestore is tcpRestore on an agent that waits for the Pod's IP, with
+// the Pod in the restore informer's cache, as Run serves it.
+func waitingTCPRestore(t *testing.T, runtime *sandboxReadyAfter, timeout time.Duration) (*NodeController, *corev1.Pod, cache.Indexer) {
+	t.Helper()
+	w, pod := tcpRestore(t, &fakeRuntime{})
+	runtime.fakeRuntime = &fakeRuntime{}
+	w.runtime = runtime
+	w.podIPWaitTimeout = timeout
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, indexer.Add(pod))
+	w.restorePodLister = corev1listers.NewPodLister(indexer)
+	return w, pod, indexer
+}
+
+func podIPPendingApplied(w *NodeController) bool {
+	for _, action := range w.clientset.(*fake.Clientset).Actions() {
+		patch, ok := action.(clientgotesting.PatchAction)
+		if ok && patch.GetSubresource() == "status" && strings.Contains(string(patch.GetPatch()), "PodIPPending") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNewDefaultControllerWaitsForThePodIP(t *testing.T) {
+	w := newDefaultController(&types.AgentConfig{}, fake.NewClientset(), nil, nil, &fakeRuntime{}, noopInjector{}, testr.New(t))
+	t.Cleanup(w.restoreQueue.ShutDown)
+
+	assert.Equal(t, restorePodIPWaitTimeout, w.podIPWaitTimeout)
+}
+
+// Without NRI, a Pod's first pass can run before its sandbox has a network.
+// The pass waits for it instead of leaving the Pod pending until kubelet's
+// next status update or the safety requeue.
+func TestRestoreWaitsWithinItsPassForTheSandboxIP(t *testing.T) {
+	runtime := &sandboxReadyAfter{failures: 3}
+	w, pod, _ := waitingTCPRestore(t, runtime, restorePodIPWaitTimeout)
+	targets := targetPodIPs(w)
+	start := time.Now()
+
+	requeue := w.reconcileRestorePod(context.Background(), pod)
+
+	assert.False(t, requeue)
+	assert.Equal(t, []string{"10.0.0.7"}, *targets)
+	assert.Equal(t, 4, runtime.lookups())
+	assert.Less(t, time.Since(start), 10*restorePodIPPollInterval)
+	assert.False(t, podIPPendingApplied(w), "the wait writes no pending condition")
+	assert.Empty(t, eventsForReason(w.clientset.(*fake.Clientset), "PodIPPending"))
+	_, waiting := w.podIPWaits.Load(string(pod.UID))
+	assert.False(t, waiting)
+}
+
+// A sandbox that never gets an IP costs one wait per Pod, not one per pass.
+func TestRestoreStopsWaitingForThePodIPAfterTheBound(t *testing.T) {
+	runtime := &sandboxReadyAfter{failures: math.MaxInt}
+	w, pod, _ := waitingTCPRestore(t, runtime, 3*restorePodIPPollInterval)
+	w.restoreFn = noRestoreExpected(t)
+	start := time.Now()
+
+	requeue := w.reconcileRestorePod(context.Background(), pod)
+
+	assert.True(t, requeue)
+	assert.GreaterOrEqual(t, time.Since(start), 3*restorePodIPPollInterval)
+	assert.True(t, podIPPendingApplied(w))
+	waited := runtime.lookups()
+	assert.Greater(t, waited, 1)
+
+	start = time.Now()
+	requeue = w.reconcileRestorePod(context.Background(), pod)
+
+	assert.True(t, requeue)
+	assert.Equal(t, waited+1, runtime.lookups(), "after the bound a pass asks once")
+	assert.Less(t, time.Since(start), restorePodIPPollInterval)
+
+	w.forgetRestorePod(pod)
+	_, waiting := w.podIPWaits.Load(string(pod.UID))
+	assert.False(t, waiting, "a deleted Pod's wait is forgotten")
+}
+
+// In a vCluster tenant no sandbox matches the Pod; the API's IP ends the wait.
+func TestRestoreTakesTheAPIPodIPThatArrivesWhileItWaits(t *testing.T) {
+	runtime := &sandboxReadyAfter{failures: math.MaxInt}
+	w, pod, indexer := waitingTCPRestore(t, runtime, restorePodIPWaitTimeout)
+	targets := targetPodIPs(w)
+	go func() {
+		time.Sleep(2 * restorePodIPPollInterval)
+		published := pod.DeepCopy()
+		published.Status.PodIP = "10.0.0.9"
+		assert.NoError(t, indexer.Update(published))
+	}()
+	start := time.Now()
+
+	requeue := w.reconcileRestorePod(context.Background(), pod)
+
+	assert.False(t, requeue)
+	assert.Equal(t, []string{"10.0.0.9"}, *targets)
+	assert.Less(t, time.Since(start), restorePodIPWaitTimeout/2)
+}
+
+func TestRestoreStopsWaitingForThePodIP(t *testing.T) {
+	for name, stop := range map[string]func(cancel context.CancelFunc, indexer cache.Indexer, pod *corev1.Pod){
+		"the agent stops":     func(cancel context.CancelFunc, _ cache.Indexer, _ *corev1.Pod) { cancel() },
+		"the Pod is deleted":  func(_ context.CancelFunc, indexer cache.Indexer, pod *corev1.Pod) { _ = indexer.Delete(pod) },
+		"the Pod is replaced": replaceCachedPod,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runtime := &sandboxReadyAfter{failures: math.MaxInt}
+			w, pod, indexer := waitingTCPRestore(t, runtime, restorePodIPWaitTimeout)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				time.Sleep(2 * restorePodIPPollInterval)
+				stop(cancel, indexer, pod)
+			}()
+			start := time.Now()
+
+			_, err := w.preflightRestore(ctx, pod)
+
+			assert.Equal(t, "PodIPPending", pendingRestoreReason(t, err))
+			assert.Less(t, time.Since(start), restorePodIPWaitTimeout/2)
+		})
+	}
+}
+
+func replaceCachedPod(_ context.CancelFunc, indexer cache.Indexer, pod *corev1.Pod) {
+	replacement := pod.DeepCopy()
+	replacement.UID = "replacement-uid"
+	_ = indexer.Update(replacement)
+}
+
+func TestHostNetworkRestoreDoesNotAskTheSandbox(t *testing.T) {
+	runtime := &fakeRuntime{sandboxIPs: []string{"10.0.0.7"}}
+	w, pod := tcpRestore(t, runtime)
+	pod.Spec.HostNetwork = true
+
+	_, err := w.preflightRestore(context.Background(), pod)
+
+	assert.Equal(t, "PodIPPending", pendingRestoreReason(t, err))
+	assert.Empty(t, runtime.sandboxPodUIDs)
 }

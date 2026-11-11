@@ -111,6 +111,12 @@ type NodeController struct {
 	// begins before kubelet publishes the container in the Pod status.
 	startedRestoreContainers sync.Map
 
+	// podIPWaits holds, per restore Pod UID, when a pass first waited for the
+	// Pod's IP. Passes keep waiting for it until podIPWaitTimeout after that;
+	// zero makes each pass ask once.
+	podIPWaits       sync.Map
+	podIPWaitTimeout time.Duration
+
 	// contentIndexer is the PodSnapshotContent informer's indexer, indexed by source pod
 	// (podRefIndex). The source-pod informer uses it to map a pod event back to its work order.
 	contentIndexer cache.Indexer
@@ -148,8 +154,8 @@ type restorePlan struct {
 	// destination of the Pod, and artifact and postRestore are unset; use
 	// sourceFor. It is empty for a restore-from Pod.
 	sources []*restorePlan
-	// podIP is the restore Pod's IP as its sandbox reports it, when the
-	// restore needs one and the API has none yet.
+	// podIP is the restore Pod's IP when the restore needs one and this
+	// pass's copy of the Pod has none: its sandbox's, or a newer copy's.
 	podIP string
 }
 
@@ -304,6 +310,7 @@ func newDefaultController(
 		hookHTTP:                  lifecyclehooks.NewHTTPClient(),
 		nowFn:                     time.Now,
 		postRestoreWaitFn:         waitOrDone,
+		podIPWaitTimeout:          restorePodIPWaitTimeout,
 	}
 	w.requeueCaptureFn = w.captureQueue.AddAfter
 	w.checkpointFn = w.executorCheckpoint
@@ -462,6 +469,7 @@ func (w *NodeController) forgetRestorePod(obj interface{}) {
 		return
 	}
 	w.handledRestores.Delete(string(pod.UID))
+	w.podIPWaits.Delete(string(pod.UID))
 	prefix := string(pod.UID) + "/"
 	w.startedRestoreContainers.Range(func(key, _ any) bool {
 		if strings.HasPrefix(key.(string), prefix) {
