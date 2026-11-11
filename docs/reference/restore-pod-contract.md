@@ -291,7 +291,8 @@ spec:
 
 On a node whose container runtime has no NRI, or NRI older than v0.10
 (containerd older than 2.2, or NRI disabled), the agent restores without the
-proxy. Its log says so when it starts. The container's own command stays PID 1,
+proxy. So does every agent of an install with `daemonset.restoreProxy.enabled:
+false`, which keeps the agent out of container creation on its nodes. Its log says so when it starts. The container's own command stays PID 1,
 and the agent restores the workload beside it. On such nodes:
 
 - Give every destination container an inert, long-running command, such as
