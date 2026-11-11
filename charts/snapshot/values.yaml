@@ -208,6 +208,14 @@ daemonset:
   # Agent and nsrestore log level (trace, debug, info, warn, error)
   snapshotLogLevel: info
 
+  # The restore proxy runs through an NRI plugin, which the container runtime
+  # calls for every container created on the node. Set false to keep the agent
+  # out of container creation: the chart then leaves the NRI socket out of the
+  # agent, which logs at startup that it restores without the proxy, as on a
+  # node without NRI. Restore Pods then need an inert command.
+  restoreProxy:
+    enabled: true
+
   # Limits the restore proxy to Pods in this host namespace on the node, and
   # leaves other restore Pods alone. Set it when other clusters share the
   # nodes, such as vCluster tenants: in a vCluster, set it to the vCluster's

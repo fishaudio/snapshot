@@ -49,6 +49,11 @@ commit-level history for each release is on its
   that asks for compression without it. A compressed snapshot needs an agent
   with this CRIU to restore. See
   [Agent config](docs/reference/api.md#agent-config-config).
+- `daemonset.restoreProxy.enabled: false` leaves the NRI socket out of the node
+  agent, so the container runtime does not call the agent for each container
+  it creates. Restores then run without the restore proxy, and restore Pods
+  need an inert command. Default `true`, unchanged. See
+  [Nodes without the restore proxy](docs/reference/restore-pod-contract.md#nodes-without-the-restore-proxy).
 
 - Lifecycle hooks: `PodSnapshot.spec.containers` and
   `SnapshotJob.spec.podSnapshotTemplate.containers` can set a

@@ -145,10 +145,12 @@ spec:
             - name: kubelet-pods
               mountPath: /var/lib/kubelet/pods
               readOnly: true
+            {{- if .Values.daemonset.restoreProxy.enabled }}
             # NRI socket directory, for the plugin that makes the restore
             # proxy PID 1 in restore containers.
             - name: nri
               mountPath: /var/run/nri
+            {{- end }}
             # The node's securityfs, read-only. CRIU looks here to find the
             # node's LSM: with it, a checkpoint records each process's
             # AppArmor label, which a restore into a labeled container needs.
@@ -345,6 +347,7 @@ spec:
           hostPath:
             path: /var/lib/kubelet/pods
             type: Directory
+        {{- if .Values.daemonset.restoreProxy.enabled }}
         # NRI socket directory. A directory, not the socket itself: a
         # socket-typed hostPath would keep the Pod from starting at all, and
         # hide the reason. On a node without NRI the agent starts, cannot
@@ -353,6 +356,7 @@ spec:
           hostPath:
             path: /var/run/nri
             type: DirectoryOrCreate
+        {{- end }}
         # Securityfs. sysfs always has the directory; where securityfs is not
         # mounted it is empty, and CRIU records no labels.
         - name: securityfs

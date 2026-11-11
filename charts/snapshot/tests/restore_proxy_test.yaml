@@ -23,6 +23,23 @@ tests:
               path: /var/run/nri
               type: DirectoryOrCreate
 
+  # Without the socket the plugin cannot register, so the runtime never calls
+  # the agent when it creates containers on the node.
+  - it: leaves the NRI socket out when the restore proxy is off
+    set:
+      daemonset.restoreProxy.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name == "agent")].volumeMounts
+          content:
+            name: nri
+          any: true
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: nri
+          any: true
+
   - it: acts on every restore Pod by default
     asserts:
       - notContains:
