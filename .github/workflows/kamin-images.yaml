@@ -1,0 +1,66 @@
+# Fork-only: builds the agent, operator and PageBroker images of the kamin/images
+# branch for linux/amd64 and pushes them to this repository's GHCR namespace,
+# tagged with the commit. Upstream's push-artifacts.yaml publishes to
+# ghcr.io/ai-dynamo/snapshot and runs only on main and release branches.
+name: kamin images
+
+on:
+  push:
+    branches: [kamin/images]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kamin-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository }}
+  # The criu-dev commit the LZ4 page compression was verified on.
+  CRIU_REF: b64199c850c22a55ce82ac81253dd9bca578acb0
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [agent, operator, pagebroker]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_SHA::12}"
+          cache="${REGISTRY}/cache:${IMAGE}"
+          make "docker-build-${IMAGE}" \
+            REGISTRY="${REGISTRY}" \
+            TAGS="${tag}" \
+            AGENT_PLATFORM=linux/amd64 \
+            DOCKER_BUILD_ARGS="--push --provenance=false --metadata-file=buildx.json \
+              --build-arg CRIU_REF=${CRIU_REF} \
+              --cache-from type=registry,ref=${cache} \
+              --cache-to type=registry,ref=${cache},mode=max"
+          digest="$(jq -er '."containerimage.digest"' buildx.json)"
+          echo "${REGISTRY}/${IMAGE}:${tag}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
