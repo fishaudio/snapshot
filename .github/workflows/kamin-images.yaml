@@ -37,16 +37,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # The runner's resolv.conf names systemd-resolved on 127.0.0.53, which the
-      # BuildKit container cannot reach, so its RUN steps fall back to Docker's
-      # 8.8.8.8 and 8.8.4.4. Those failed to resolve the Ubuntu archive in every
-      # apt-get here. Give BuildKit the resolvers systemd-resolved itself uses.
-      - name: Point BuildKit at the runner's DNS
+      # On 2026-11-11 every apt-get in these builds failed to resolve the Ubuntu
+      # archive, with both Docker's default resolvers and the runner's own
+      # (168.63.129.16): one of ubuntu.com's three name servers timed out.
+      # Resolvers that answered then come first; the runner's stay as fallback.
+      - name: Point BuildKit at working resolvers
         run: |
           set -euo pipefail
-          ns=$(awk '/^nameserver/ {printf "%s\"%s\"", (n++ ? ", " : ""), $2}' /run/systemd/resolve/resolv.conf)
-          test -n "${ns}"
-          printf '[dns]\n  nameservers = [%s]\n' "${ns}" | tee "${RUNNER_TEMP}/buildkitd.toml"
+          ns=$(awk '/^nameserver/ {printf ", \"%s\"", $2}' /run/systemd/resolve/resolv.conf)
+          printf '[dns]\n  nameservers = ["1.1.1.1", "9.9.9.9"%s]\n' "${ns}" | tee "${RUNNER_TEMP}/buildkitd.toml"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
