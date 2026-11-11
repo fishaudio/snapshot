@@ -131,7 +131,11 @@ def source_pod(
     )
     # The test creates the PodSnapshot itself. Preserve workload activation and
     # other annotations, but do not treat the source as a restore destination.
-    for annotation in (RESTORE_FROM_ANNOTATION, "nvidia.com/restore-container-map"):
+    for annotation in (
+        RESTORE_FROM_ANNOTATION,
+        "nvidia.com/restore-container-map",
+        "nvidia.com/restore-from-map",
+    ):
         pod["metadata"]["annotations"].pop(annotation, None)
     return pod
 

@@ -114,6 +114,40 @@ func TestCreateContainerScope(t *testing.T) {
 	}
 }
 
+// A restore-from-map Pod restores several containers, each from its own
+// PodSnapshot; its other containers start normally.
+func TestCreateContainerShapesRestoreFromMapDestinations(t *testing.T) {
+	restoreFromMap := map[string]string{podcontract.RestoreFromMapAnnotation: "prefill=snap-prefill,decode=snap-decode"}
+	for name, tc := range map[string]struct {
+		container  string
+		wantShaped bool
+	}{
+		"first destination":     {container: "prefill", wantShaped: true},
+		"second destination":    {container: "decode", wantShaped: true},
+		"sidecar is left alone": {container: "router"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			restorer := &fakeRestorer{destinations: []string{"prefill", "decode"}}
+			p, root := testPlugin(t, restorer)
+
+			adjust, _, err := p.CreateContainer(context.Background(), restoreSandbox(restoreFromMap), &api.Container{Name: tc.container})
+
+			require.NoError(t, err)
+			assert.Equal(t, 1, restorer.calls)
+			assert.Equal(t, restoreFromMap, restorer.pod.Annotations)
+			installed := filepath.Join(root, "pod-uid", tc.container, podcontract.RestoreProxyBinaryName)
+			if !tc.wantShaped {
+				assert.Nil(t, adjust)
+				assert.NoFileExists(t, installed)
+				return
+			}
+			require.NotNil(t, adjust)
+			assert.Equal(t, []string{podcontract.RestoreProxyPath}, adjust.GetArgs())
+			assert.FileExists(t, installed, "each destination gets the proxy in its own control directory")
+		})
+	}
+}
+
 func TestCreateContainerPassesPodIdentityToRestorer(t *testing.T) {
 	t.Run("plain cluster", func(t *testing.T) {
 		annotations := map[string]string{

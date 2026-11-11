@@ -18,9 +18,13 @@ import (
 // refuseRestore records a restore this node will not attempt. It is terminal
 // like any other restore failure and reports through the same condition, with
 // its own reason so an operator can tell a checkpoint that cannot run here from
-// one that tried and broke.
-func (w *NodeController) refuseRestore(ctx context.Context, pod *corev1.Pod, incompatible *compat.IncompatibleError) bool {
+// one that tried and broke. source names the PodSnapshot that a restore-from-map
+// Pod was refused for; it is empty for a restore-from Pod.
+func (w *NodeController) refuseRestore(ctx context.Context, pod *corev1.Pod, incompatible *compat.IncompatibleError, source string) bool {
 	reason := compat.Reasons(incompatible.Mismatches)
+	if source != "" {
+		reason = source + ": " + reason
+	}
 	w.logRestoreRefusal(pod, incompatible, reason)
 	return w.finishRestore(
 		ctx,

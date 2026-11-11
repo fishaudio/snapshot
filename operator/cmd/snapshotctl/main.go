@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ai-dynamo/snapshot/api/podcontract"
 	"github.com/ai-dynamo/snapshot/operator/internal/logging"
 )
 
@@ -99,7 +100,8 @@ func runRestore(args []string) error {
 	manifest := flags.String("manifest", "", "Path to a worker Pod manifest used to create a new restore pod")
 	namespace := flags.String("namespace", "", "Namespace override; defaults to the manifest namespace or current kube context namespace")
 	kubeContext := flags.String("kube-context", "", "Kubernetes context override")
-	snapshotName := flags.String("snapshot", "", "Required. PodSnapshot name in the restore pod namespace")
+	snapshotName := flags.String("snapshot", "", "PodSnapshot name in the restore pod namespace. Required unless the manifest sets "+
+		podcontract.RestoreFromMapAnnotation)
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -109,9 +111,6 @@ func runRestore(args []string) error {
 	}
 	if *manifest == "" {
 		return fmt.Errorf("--manifest is required")
-	}
-	if *snapshotName == "" {
-		return fmt.Errorf("--snapshot is required")
 	}
 
 	snapshotctlLog.Info("Running restore", "manifest", *manifest, "namespace", *namespace, "pod_snapshot", *snapshotName)
@@ -144,5 +143,6 @@ Subcommands:
 Examples:
   snapshotctl checkpoint --manifest /tmp/vllm-worker-pod.yaml --snapshot worker-snapshot --container main
   snapshotctl restore --manifest /tmp/sglang-worker-pod.yaml --snapshot worker-snapshot
+  snapshotctl restore --manifest /tmp/prefill-decode-pod.yaml  # the manifest sets nvidia.com/restore-from-map
 `)
 }

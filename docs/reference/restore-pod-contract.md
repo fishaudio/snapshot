@@ -160,7 +160,8 @@ created. Without `restore-container-map`, it reads the PodSnapshot that
 `restore-from` names, for the checkpointed container's name. Create the restore Pod
 after that PodSnapshot exists; it does not have to be Ready yet. Until it
 exists, container creation fails, and kubelet retries with a backoff of up to 5
-minutes.
+minutes. A Pod with `restore-from-map` names its destinations itself, so it can
+be created before its PodSnapshots exist.
 
 Probes belong to the workload. Kubernetes runs liveness and readiness probes
 from container start, while the restore is still running and nothing in the
@@ -185,6 +186,106 @@ The proxy reserves two exit codes:
 
 Every other exit code is the restored workload's own, or 128 plus the number of
 the signal that ended it.
+
+## Restore from several PodSnapshots
+
+A PodSnapshot checkpoints one container. To restore several containers of one
+Pod from different PodSnapshots, such as the prefill and decode containers of a
+disaggregated serving unit, set `nvidia.com/restore-from-map` instead of
+`restore-from`. Its value is a comma-separated list of
+`destination=snapshot` pairs: the checkpointed container of each named
+PodSnapshot, in the Pod's namespace, restores into that destination container.
+
+- A Pod that sets `restore-from-map` together with `restore-from` or
+  `restore-container-map` fails its restore.
+- Each destination appears once. Two destinations may name the same
+  PodSnapshot, which restores it into both.
+- The map names at most 8 destinations (`podcontract.MaxSnapshotMappings`).
+- Each destination meets the same requirements as above: the
+  `snapshot-control` mount with `subPath` equal to its name, and
+  `SNAPSHOT_CONTROL_DIR`. Other containers start normally.
+
+The restore waits until every PodSnapshot is Ready and its snapshot is
+available, then restores all destinations in parallel. A PodSnapshot that
+failed, or that this node cannot run, ends the restore before any destination
+is restored. The `nvidia.com/Restored` condition reports the destinations
+together, with the same reasons as fan-out, and its messages name each
+destination's PodSnapshot. A Pod whose restore partially succeeded keeps the
+destinations that restored running; delete it to restore again.
+
+Go integrations set `Request.SnapshotMappings` instead of `SnapshotName`,
+`SourceContainer`, and `Mappings`:
+
+```go
+restored, err := podcontract.Build(pod, podcontract.Request{
+    SnapshotMappings: []podcontract.SnapshotMapping{
+        {Destination: "prefill", SnapshotName: "prefill-snapshot"},
+        {Destination: "decode", SnapshotName: "decode-snapshot"},
+    },
+}, options)
+```
+
+This example restores two PodSnapshots into one Pod, beside a sidecar that
+starts normally:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restored-prefill-decode
+  annotations:
+    nvidia.com/restore-from-map: decode=decode-snapshot,prefill=prefill-snapshot
+spec:
+  volumes:
+    - name: snapshot-control
+      emptyDir: {}
+  containers:
+    - name: prefill
+      image: worker:latest
+      securityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/block-iouring.json
+      # The source's command. Snapshot replaces it with its restore proxy.
+      command: ["/app/worker", "--role=prefill"]
+      env:
+        - name: SNAPSHOT_CONTROL_DIR
+          value: /snapshot-control
+      volumeMounts:
+        - name: snapshot-control
+          mountPath: /snapshot-control
+          subPath: prefill
+      startupProbe:
+        exec:
+          command: ["cat", "/snapshot-control/restore-complete"]
+        timeoutSeconds: 1
+        periodSeconds: 1
+        failureThreshold: 1800
+        successThreshold: 1
+    - name: decode
+      image: worker:latest
+      securityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/block-iouring.json
+      command: ["/app/worker", "--role=decode"]
+      env:
+        - name: SNAPSHOT_CONTROL_DIR
+          value: /snapshot-control
+      volumeMounts:
+        - name: snapshot-control
+          mountPath: /snapshot-control
+          subPath: decode
+      startupProbe:
+        exec:
+          command: ["cat", "/snapshot-control/restore-complete"]
+        timeoutSeconds: 1
+        periodSeconds: 1
+        failureThreshold: 1800
+        successThreshold: 1
+    - name: router
+      image: router:latest
+```
 
 ## Nodes without the restore proxy
 

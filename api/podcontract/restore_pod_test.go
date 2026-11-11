@@ -434,3 +434,227 @@ func removeRestoreEnv(env []corev1.EnvVar, name string) []corev1.EnvVar {
 	}
 	return result
 }
+
+func fanInPodFixture() *corev1.Pod {
+	pod := restorePodFixture()
+	pod.Spec.Containers = []corev1.Container{
+		{Name: "prefill", Image: "worker:latest", Command: []string{"python3"}, Args: []string{"prefill.py"}},
+		{Name: "decode", Image: "worker:latest", Command: []string{"python3"}, Args: []string{"decode.py"}},
+		{Name: "router", Image: "router:latest"},
+	}
+	return pod
+}
+
+func fanInRequest() Request {
+	return Request{SnapshotMappings: []SnapshotMapping{
+		{Destination: "prefill", SnapshotName: "snap-prefill"},
+		{Destination: "decode", SnapshotName: "snap-decode"},
+	}}
+}
+
+func TestBuildShapesSnapshotMappingsIdempotently(t *testing.T) {
+	original := fanInPodFixture()
+	before := original.DeepCopy()
+	options := Options{SeccompProfile: DefaultSeccompLocalhostProfile, EnableStartupGate: true}
+
+	first, err := Build(original, fanInRequest(), options)
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+	if !reflect.DeepEqual(original, before) {
+		t.Fatal("Build() mutated its input")
+	}
+	second, err := Build(first, fanInRequest(), options)
+	if err != nil {
+		t.Fatalf("second Build() failed: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("Build() is not idempotent")
+	}
+	if got := first.Annotations[RestoreFromMapAnnotation]; got != "decode=snap-decode,prefill=snap-prefill" {
+		t.Fatalf("%s = %q", RestoreFromMapAnnotation, got)
+	}
+	for _, name := range []string{RestoreFromAnnotation, RestoreContainerMapAnnotation} {
+		if _, found := first.Annotations[name]; found {
+			t.Fatalf("Build() set %s for a restore-from-map request", name)
+		}
+	}
+	if first.Annotations["example.com/team"] != "inference" {
+		t.Fatal("unrelated annotation was not preserved")
+	}
+	if len(first.Spec.Volumes) != 1 {
+		t.Fatalf("expected one shared volume, got %d", len(first.Spec.Volumes))
+	}
+	for i, name := range []string{"prefill", "decode"} {
+		container := &first.Spec.Containers[i]
+		if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].SubPath != name {
+			t.Fatalf("container %q mount = %#v", name, container.VolumeMounts)
+		}
+		if got := restoreEnvValue(container.Env, SnapshotControlDirEnv); got != SnapshotControlMountPath {
+			t.Fatalf("container %q %s = %q", name, SnapshotControlDirEnv, got)
+		}
+		if !reflect.DeepEqual(container.StartupProbe, canonicalRestoreStartupProbe()) {
+			t.Fatalf("container %q startup gate = %#v", name, container.StartupProbe)
+		}
+		if !reflect.DeepEqual(container.Args, before.Spec.Containers[i].Args) {
+			t.Fatalf("container %q workload args changed: %v", name, container.Args)
+		}
+	}
+	if !reflect.DeepEqual(first.Spec.Containers[2], before.Spec.Containers[2]) {
+		t.Fatal("non-destination container was modified")
+	}
+
+	reordered := Request{SnapshotMappings: []SnapshotMapping{
+		{Destination: "decode", SnapshotName: " snap-decode "},
+		{Destination: "prefill", SnapshotName: "snap-prefill"},
+	}}
+	if err := Validate(first, reordered); err != nil {
+		t.Fatalf("Validate() rejected builder output: %v", err)
+	}
+}
+
+func TestBuildShapesSnapshotMappingsThatShareAPodSnapshot(t *testing.T) {
+	pod := restorePodFixture()
+	pod.Spec.Containers = []corev1.Container{{Name: "engine-0"}, {Name: "engine-1"}}
+	request := Request{SnapshotMappings: []SnapshotMapping{
+		{Destination: "engine-1", SnapshotName: "snapshot-a"},
+		{Destination: "engine-0", SnapshotName: "snapshot-a"},
+	}}
+
+	shaped, err := Build(pod, request, Options{})
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+	if got := shaped.Annotations[RestoreFromMapAnnotation]; got != "engine-0=snapshot-a,engine-1=snapshot-a" {
+		t.Fatalf("%s = %q", RestoreFromMapAnnotation, got)
+	}
+	if err := Validate(shaped, request); err != nil {
+		t.Fatalf("Validate() rejected builder output: %v", err)
+	}
+}
+
+func TestBuildRejectsSnapshotMappingConflictsAtomically(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*corev1.Pod)
+		request Request
+	}{
+		{
+			name:   "restore-from on the Pod",
+			mutate: func(pod *corev1.Pod) { pod.Annotations[RestoreFromAnnotation] = "snap-prefill" },
+		},
+		{
+			name:   "container map on the Pod",
+			mutate: func(pod *corev1.Pod) { pod.Annotations[RestoreContainerMapAnnotation] = "main=prefill" },
+		},
+		{
+			name:   "different restore-from-map on the Pod",
+			mutate: func(pod *corev1.Pod) { pod.Annotations[RestoreFromMapAnnotation] = "prefill=snap-other" },
+		},
+		{
+			name: "SnapshotName with SnapshotMappings",
+			request: Request{SnapshotName: "snap-prefill", SnapshotMappings: []SnapshotMapping{
+				{Destination: "prefill", SnapshotName: "snap-prefill"},
+			}},
+		},
+		{
+			name: "Mappings with SnapshotMappings",
+			request: Request{
+				Mappings:         []ContainerMapping{{Source: "main", Destination: "prefill"}},
+				SnapshotMappings: []SnapshotMapping{{Destination: "prefill", SnapshotName: "snap-prefill"}},
+			},
+		},
+		{
+			name: "missing destination",
+			request: Request{SnapshotMappings: []SnapshotMapping{
+				{Destination: "missing", SnapshotName: "snap-prefill"},
+			}},
+		},
+		{
+			name: "duplicate destination",
+			request: Request{SnapshotMappings: []SnapshotMapping{
+				{Destination: "prefill", SnapshotName: "snap-prefill"},
+				{Destination: "prefill", SnapshotName: "snap-decode"},
+			}},
+		},
+		{
+			name: "invalid PodSnapshot name",
+			request: Request{SnapshotMappings: []SnapshotMapping{
+				{Destination: "prefill", SnapshotName: "Bad_Name"},
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pod := fanInPodFixture()
+			if test.mutate != nil {
+				test.mutate(pod)
+			}
+			request := test.request
+			if request.SnapshotMappings == nil {
+				request = fanInRequest()
+			}
+			before := pod.DeepCopy()
+
+			if _, err := Build(pod, request, Options{}); err == nil {
+				t.Fatal("Build() unexpectedly succeeded")
+			}
+			if !reflect.DeepEqual(pod, before) {
+				t.Fatal("Build() mutated input after failure")
+			}
+		})
+	}
+}
+
+func TestBuildSingleSnapshotRejectsRestoreFromMap(t *testing.T) {
+	pod := restorePodFixture()
+	pod.Annotations[RestoreFromMapAnnotation] = "main=snapshot-a"
+
+	if _, err := Build(pod, restoreRequest(), Options{}); err == nil {
+		t.Fatal("Build() accepted a restore-from request for a Pod that sets restore-from-map")
+	}
+}
+
+func TestValidateRejectsSnapshotMappingDrift(t *testing.T) {
+	valid, err := Build(fanInPodFixture(), fanInRequest(), Options{})
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+	if err := Validate(valid, fanInRequest()); err != nil {
+		t.Fatalf("Validate() rejected builder output: %v", err)
+	}
+	tests := map[string]func(*corev1.Pod){
+		"annotation missing": func(pod *corev1.Pod) {
+			delete(pod.Annotations, RestoreFromMapAnnotation)
+		},
+		"annotation names another PodSnapshot": func(pod *corev1.Pod) {
+			pod.Annotations[RestoreFromMapAnnotation] = "decode=snap-other,prefill=snap-prefill"
+		},
+		"annotation drops a destination": func(pod *corev1.Pod) {
+			pod.Annotations[RestoreFromMapAnnotation] = "prefill=snap-prefill"
+		},
+		"restore-from added": func(pod *corev1.Pod) {
+			pod.Annotations[RestoreFromAnnotation] = "snap-prefill"
+		},
+		"shared control directory": func(pod *corev1.Pod) {
+			pod.Spec.Containers[1].VolumeMounts[0].SubPath = "prefill"
+		},
+		"environment": func(pod *corev1.Pod) {
+			pod.Spec.Containers[1].Env = removeRestoreEnv(pod.Spec.Containers[1].Env, SnapshotControlDirEnv)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			pod := valid.DeepCopy()
+			mutate(pod)
+			if err := Validate(pod, fanInRequest()); err == nil {
+				t.Fatal("Validate() unexpectedly succeeded")
+			}
+		})
+	}
+
+	// A restore-from request does not match a restore-from-map Pod.
+	if err := Validate(valid, restoreRequest()); err == nil {
+		t.Fatal("Validate() accepted a restore-from-map Pod for a restore-from request")
+	}
+}

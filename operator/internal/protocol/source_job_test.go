@@ -329,6 +329,25 @@ func TestNewSourceJobRejectsRestoreAnnotations(t *testing.T) {
 	}
 }
 
+func TestNewSourceJobRejectsRestoreFromMapAnnotation(t *testing.T) {
+	_, err := NewSourceJob(&corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{podcontract.RestoreFromMapAnnotation: "main=snapshot-a"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "main", Command: []string{"python3"}}},
+		},
+	}, SourceJobOptions{
+		Namespace:       "test-ns",
+		TargetContainer: "main",
+		Name:            "test-job",
+	})
+
+	if err == nil || !strings.Contains(err.Error(), podcontract.RestoreFromMapAnnotation) {
+		t.Fatalf("expected restore annotation rejection, got %v", err)
+	}
+}
+
 func TestNewSourceJobRejectsUnknownTarget(t *testing.T) {
 	_, err := NewSourceJob(&corev1.PodTemplateSpec{
 		Spec: corev1.PodSpec{

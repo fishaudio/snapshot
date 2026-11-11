@@ -18,10 +18,28 @@ const restoreStartupFailureThreshold int32 = 1800 // 30 minutes at 1s cadence.
 // Request identifies the PodSnapshot source and its restore destinations.
 // Empty Mappings default to restoring SourceContainer into a same-named
 // destination container.
+//
+// SnapshotMappings instead restores each destination from its own PodSnapshot,
+// through RestoreFromMapAnnotation. A Request sets it or the other fields,
+// never both.
 type Request struct {
-	SnapshotName    string
-	SourceContainer string
-	Mappings        []ContainerMapping
+	SnapshotName     string
+	SourceContainer  string
+	Mappings         []ContainerMapping
+	SnapshotMappings []SnapshotMapping
+}
+
+// destinations returns the restore destination containers of a normalized
+// request.
+func (r Request) destinations() []string {
+	names := make([]string, 0, len(r.Mappings)+len(r.SnapshotMappings))
+	for _, mapping := range r.Mappings {
+		names = append(names, mapping.Destination)
+	}
+	for _, mapping := range r.SnapshotMappings {
+		names = append(names, mapping.Destination)
+	}
+	return names
 }
 
 // Options controls optional restore Pod shaping. Its zero value applies only
@@ -42,7 +60,8 @@ type Options struct {
 // is never mutated, including when validation fails. Container commands stay as
 // the caller set them: the node agent replaces them when it restores. Mapping
 // sources must come from the referenced PodSnapshot; this pure builder performs
-// no API read to derive them.
+// no API read to derive them. SnapshotMappings name no source: each
+// PodSnapshot's single captured container is the source.
 func Build(pod *corev1.Pod, request Request, options Options) (*corev1.Pod, error) {
 	if pod == nil {
 		return nil, fmt.Errorf("restore pod is nil")
@@ -55,7 +74,7 @@ func Build(pod *corev1.Pod, request Request, options Options) (*corev1.Pod, erro
 	if err := ensureRestoreAnnotations(result, request); err != nil {
 		return nil, err
 	}
-	if err := ensureRestorePodSpec(&result.Spec, request.Mappings, options); err != nil {
+	if err := ensureRestorePodSpec(&result.Spec, request.destinations(), options); err != nil {
 		return nil, err
 	}
 	if err := validateCanonicalRestorePod(result, request, options); err != nil {
@@ -86,10 +105,10 @@ func validateMinimumRestorePod(pod *corev1.Pod, request Request) error {
 	if err := validateControlVolume(&pod.Spec); err != nil {
 		return err
 	}
-	for _, mapping := range request.Mappings {
-		container := findContainer(&pod.Spec, mapping.Destination)
+	for _, destination := range request.destinations() {
+		container := findContainer(&pod.Spec, destination)
 		if container == nil {
-			return fmt.Errorf("restore pod has no destination container named %q", mapping.Destination)
+			return fmt.Errorf("restore pod has no destination container named %q", destination)
 		}
 		if err := validateControlMount(container); err != nil {
 			return err
@@ -105,8 +124,8 @@ func validateCanonicalRestorePod(pod *corev1.Pod, request Request, options Optio
 	if err := validateMinimumRestorePod(pod, request); err != nil {
 		return err
 	}
-	for _, mapping := range request.Mappings {
-		container := findContainer(&pod.Spec, mapping.Destination)
+	for _, destination := range request.destinations() {
+		container := findContainer(&pod.Spec, destination)
 		if options.EnableStartupGate {
 			if err := validateCanonicalRestoreStartupProbe(container); err != nil {
 				return err
@@ -120,6 +139,9 @@ func validateCanonicalRestorePod(pod *corev1.Pod, request Request, options Optio
 }
 
 func normalizeRequest(request Request) (Request, error) {
+	if len(request.SnapshotMappings) != 0 {
+		return normalizeSnapshotMappingRequest(request)
+	}
 	snapshotName, err := validateRestoreFromSnapshotName(request.SnapshotName)
 	if err != nil {
 		return Request{}, err
@@ -138,9 +160,34 @@ func normalizeRequest(request Request) (Request, error) {
 	return request, nil
 }
 
+func normalizeSnapshotMappingRequest(request Request) (Request, error) {
+	if strings.TrimSpace(request.SnapshotName) != "" || strings.TrimSpace(request.SourceContainer) != "" ||
+		len(request.Mappings) != 0 {
+		return Request{}, fmt.Errorf(
+			"restore request SnapshotMappings cannot be combined with SnapshotName, SourceContainer or Mappings")
+	}
+	mappings := make([]SnapshotMapping, 0, len(request.SnapshotMappings))
+	for _, mapping := range request.SnapshotMappings {
+		mappings = append(mappings, SnapshotMapping{
+			Destination:  strings.TrimSpace(mapping.Destination),
+			SnapshotName: strings.TrimSpace(mapping.SnapshotName),
+		})
+	}
+	if err := ValidateSnapshotMappings(mappings); err != nil {
+		return Request{}, err
+	}
+	return Request{SnapshotMappings: mappings}, nil
+}
+
 func ensureRestoreAnnotations(pod *corev1.Pod, request Request) error {
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string, 2)
+	}
+	if len(request.SnapshotMappings) != 0 {
+		return ensureSnapshotMappingAnnotation(pod, request.SnapshotMappings)
+	}
+	if _, found := pod.Annotations[RestoreFromMapAnnotation]; found {
+		return fmt.Errorf("%s conflicts with requested PodSnapshot %q", RestoreFromMapAnnotation, request.SnapshotName)
 	}
 	if existing, found := pod.Annotations[RestoreFromAnnotation]; found {
 		resolved, err := validateRestoreFromSnapshotName(existing)
@@ -167,7 +214,7 @@ func ensureRestoreAnnotations(pod *corev1.Pod, request Request) error {
 		if err := ValidateContainerMappings(existingMappings, request.SourceContainer); err != nil {
 			return err
 		}
-		if !sameContainerMappings(existingMappings, request.Mappings) {
+		if !sameMappings(existingMappings, request.Mappings) {
 			return fmt.Errorf("%s conflicts with requested restore mappings", RestoreContainerMapAnnotation)
 		}
 		if needsMapping {
@@ -183,7 +230,24 @@ func ensureRestoreAnnotations(pod *corev1.Pod, request Request) error {
 	return nil
 }
 
+func ensureSnapshotMappingAnnotation(pod *corev1.Pod, mappings []SnapshotMapping) error {
+	if _, found := pod.Annotations[RestoreFromMapAnnotation]; found {
+		existing, err := SnapshotMappingsFromAnnotations(pod.Annotations)
+		if err != nil {
+			return err
+		}
+		if !sameMappings(existing, mappings) {
+			return fmt.Errorf("%s conflicts with requested restore mappings", RestoreFromMapAnnotation)
+		}
+	}
+	pod.Annotations[RestoreFromMapAnnotation] = formatSnapshotMappings(mappings)
+	return rejectMixedRestoreAnnotations(pod.Annotations)
+}
+
 func validateRestoreAnnotations(annotations map[string]string, request Request) error {
+	if len(request.SnapshotMappings) != 0 {
+		return validateSnapshotMappingAnnotation(annotations, request.SnapshotMappings)
+	}
 	resolved, err := GetRestoreFromSnapshotName(annotations)
 	if err != nil {
 		return err
@@ -198,10 +262,35 @@ func validateRestoreAnnotations(annotations map[string]string, request Request) 
 	if err := ValidateContainerMappings(annotatedMappings, request.SourceContainer); err != nil {
 		return err
 	}
-	if !sameContainerMappings(annotatedMappings, request.Mappings) {
+	if !sameMappings(annotatedMappings, request.Mappings) {
 		return fmt.Errorf("%s does not match the requested restore mappings", RestoreContainerMapAnnotation)
 	}
 	return nil
+}
+
+func validateSnapshotMappingAnnotation(annotations map[string]string, mappings []SnapshotMapping) error {
+	annotated, err := SnapshotMappingsFromAnnotations(annotations)
+	if err != nil {
+		return err
+	}
+	if annotated == nil {
+		return fmt.Errorf("restore pod is missing %s", RestoreFromMapAnnotation)
+	}
+	if !sameMappings(annotated, mappings) {
+		return fmt.Errorf("%s does not match the requested restore mappings", RestoreFromMapAnnotation)
+	}
+	return nil
+}
+
+// formatSnapshotMappings renders the canonical restore-from-map value, sorted
+// so equivalent requests build the same Pod.
+func formatSnapshotMappings(mappings []SnapshotMapping) string {
+	formatted := make([]string, 0, len(mappings))
+	for _, mapping := range mappings {
+		formatted = append(formatted, mapping.Destination+"="+mapping.SnapshotName)
+	}
+	sort.Strings(formatted)
+	return strings.Join(formatted, ",")
 }
 
 func formatContainerMappings(mappings []ContainerMapping) (string, bool) {
@@ -216,11 +305,13 @@ func formatContainerMappings(mappings []ContainerMapping) (string, bool) {
 	return strings.Join(formatted, ","), true
 }
 
-func sameContainerMappings(left, right []ContainerMapping) bool {
+// sameMappings compares two validated mapping lists as sets. Validation rules
+// out duplicate destinations, so equal lengths make the check exact.
+func sameMappings[M ContainerMapping | SnapshotMapping](left, right []M) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	want := make(map[ContainerMapping]struct{}, len(right))
+	want := make(map[M]struct{}, len(right))
 	for _, mapping := range right {
 		want[mapping] = struct{}{}
 	}
@@ -232,14 +323,14 @@ func sameContainerMappings(left, right []ContainerMapping) bool {
 	return true
 }
 
-func ensureRestorePodSpec(spec *corev1.PodSpec, mappings []ContainerMapping, options Options) error {
+func ensureRestorePodSpec(spec *corev1.PodSpec, destinations []string, options Options) error {
 	if err := ensureControlVolume(spec); err != nil {
 		return err
 	}
-	for _, mapping := range mappings {
-		container := findContainer(spec, mapping.Destination)
+	for _, destination := range destinations {
+		container := findContainer(spec, destination)
 		if container == nil {
-			return fmt.Errorf("restore pod has no destination container named %q", mapping.Destination)
+			return fmt.Errorf("restore pod has no destination container named %q", destination)
 		}
 		if err := ensureContainerSeccompProfile(container, options.SeccompProfile); err != nil {
 			return err

@@ -4,7 +4,9 @@
 package podcontract
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -195,5 +197,111 @@ func TestIsReservedControlFile(t *testing.T) {
 		if IsReservedControlFile(name) {
 			t.Errorf("IsReservedControlFile(%q) = true, want false", name)
 		}
+	}
+}
+
+func TestRestoreRequested(t *testing.T) {
+	for name, tc := range map[string]struct {
+		annotations map[string]string
+		want        bool
+	}{
+		"restore-from":     {annotations: map[string]string{RestoreFromAnnotation: "snapshot-a"}, want: true},
+		"restore-from-map": {annotations: map[string]string{RestoreFromMapAnnotation: "main=snapshot-a"}, want: true},
+		"container map":    {annotations: map[string]string{RestoreContainerMapAnnotation: "main=engine-0"}},
+		"none":             {annotations: map[string]string{"example.com/team": "inference"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := RestoreRequested(tc.annotations); got != tc.want {
+				t.Fatalf("RestoreRequested() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetRestoreFromSnapshotNameRejectsRestoreFromMap(t *testing.T) {
+	_, err := GetRestoreFromSnapshotName(map[string]string{
+		RestoreFromAnnotation:    "snapshot-a",
+		RestoreFromMapAnnotation: "main=snapshot-a",
+	})
+	if err == nil {
+		t.Fatal("GetRestoreFromSnapshotName() accepted a Pod that also sets restore-from-map")
+	}
+}
+
+func TestSnapshotMappingsFromAnnotations(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		got, err := SnapshotMappingsFromAnnotations(map[string]string{RestoreFromAnnotation: "snapshot-a"})
+		if err != nil || got != nil {
+			t.Fatalf("SnapshotMappingsFromAnnotations() = %#v, %v", got, err)
+		}
+	})
+
+	t.Run("parses one PodSnapshot per destination", func(t *testing.T) {
+		got, err := SnapshotMappingsFromAnnotations(map[string]string{
+			RestoreFromMapAnnotation: " prefill = snap-prefill,decode=snap-decode ",
+			"example.com/team":       "inference",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []SnapshotMapping{
+			{Destination: "prefill", SnapshotName: "snap-prefill"},
+			{Destination: "decode", SnapshotName: "snap-decode"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("mappings = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("two destinations may name one PodSnapshot", func(t *testing.T) {
+		got, err := SnapshotMappingsFromAnnotations(map[string]string{
+			RestoreFromMapAnnotation: "engine-0=snapshot-a,engine-1=snapshot-a,decode=snap-decode",
+		})
+		if err != nil || len(got) != 3 {
+			t.Fatalf("SnapshotMappingsFromAnnotations() = %#v, %v", got, err)
+		}
+	})
+
+	tooMany := make([]string, 0, MaxSnapshotMappings+1)
+	for i := range MaxSnapshotMappings + 1 {
+		tooMany = append(tooMany, fmt.Sprintf("engine-%d=snapshot-a", i))
+	}
+	for name, annotations := range map[string]map[string]string{
+		"empty":                   {RestoreFromMapAnnotation: ""},
+		"missing equals":          {RestoreFromMapAnnotation: "prefill"},
+		"too many equals":         {RestoreFromMapAnnotation: "prefill=snap=a"},
+		"empty entry":             {RestoreFromMapAnnotation: "prefill=snap-prefill,"},
+		"empty destination":       {RestoreFromMapAnnotation: "=snap-prefill"},
+		"empty snapshot":          {RestoreFromMapAnnotation: "prefill="},
+		"invalid destination":     {RestoreFromMapAnnotation: "Prefill_0=snap-prefill"},
+		"invalid snapshot":        {RestoreFromMapAnnotation: "prefill=Bad_Name"},
+		"duplicate destination":   {RestoreFromMapAnnotation: "prefill=snap-a,prefill=snap-b"},
+		"too many destinations":   {RestoreFromMapAnnotation: strings.Join(tooMany, ",")},
+		"with restore-from":       {RestoreFromMapAnnotation: "prefill=snap-prefill", RestoreFromAnnotation: "snap-prefill"},
+		"with empty restore-from": {RestoreFromMapAnnotation: "prefill=snap-prefill", RestoreFromAnnotation: ""},
+		"with container map": {
+			RestoreFromMapAnnotation:      "prefill=snap-prefill",
+			RestoreContainerMapAnnotation: "main=prefill",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := SnapshotMappingsFromAnnotations(annotations); err == nil {
+				t.Fatalf("SnapshotMappingsFromAnnotations() = %#v, want error", got)
+			}
+		})
+	}
+}
+
+func TestValidateSnapshotMappingsLimit(t *testing.T) {
+	mappings := make([]SnapshotMapping, 0, MaxSnapshotMappings+1)
+	for i := range MaxSnapshotMappings {
+		mappings = append(mappings, SnapshotMapping{Destination: fmt.Sprintf("engine-%d", i), SnapshotName: "snapshot-a"})
+	}
+	if err := ValidateSnapshotMappings(mappings); err != nil {
+		t.Fatalf("ValidateSnapshotMappings() rejected %d mappings: %v", len(mappings), err)
+	}
+	mappings = append(mappings, SnapshotMapping{Destination: "engine-extra", SnapshotName: "snapshot-a"})
+	if err := ValidateSnapshotMappings(mappings); err == nil {
+		t.Fatalf("ValidateSnapshotMappings() accepted %d mappings", len(mappings))
 	}
 }

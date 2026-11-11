@@ -57,5 +57,9 @@ The restore manifest must contain a container with the same name checkpointed by
 `PodSnapshot`. `snapshotctl` returns once the restore is submitted — watch the
 pod's `nvidia.com/Restored` status condition, readiness, and events for progress.
 
+To restore containers from different `PodSnapshot`s, omit `--snapshot` and set
+[`nvidia.com/restore-from-map`](restore-pod-contract.md#restore-from-several-podsnapshots)
+in the manifest.
+
 The source README for the tool lives at
 [`operator/cmd/snapshotctl/README.md`](../../operator/cmd/snapshotctl/README.md).
