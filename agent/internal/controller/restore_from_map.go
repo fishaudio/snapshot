@@ -68,10 +68,11 @@ func (w *NodeController) preflightRestoreFromMap(ctx context.Context, pod *corev
 			return nil, withRestoreSource(source.group, err)
 		}
 	}
-	if err := w.preflightPodIP(pod); err != nil {
+	podIP, err := w.preflightPodIP(ctx, pod)
+	if err != nil {
 		return nil, err
 	}
-	plan := &restorePlan{skipCompatCheck: skipCompatCheck}
+	plan := &restorePlan{skipCompatCheck: skipCompatCheck, podIP: podIP}
 	for _, source := range sources {
 		source.plan.postRestore, source.plan.postRestorePeriod, err = planPostRestore(
 			pod, source.plan.mappings, source.action, w.hookExec, w.hookHTTP)

@@ -8,6 +8,7 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -147,6 +148,9 @@ type restorePlan struct {
 	// destination of the Pod, and artifact and postRestore are unset; use
 	// sourceFor. It is empty for a restore-from Pod.
 	sources []*restorePlan
+	// podIP is the restore Pod's IP as its sandbox reports it, when the
+	// restore needs one and the API has none yet.
+	podIP string
 }
 
 type restoreResultState int
@@ -188,6 +192,9 @@ type restoreOperation struct {
 	containerID       string
 	startedAt         time.Time
 	log               logr.Logger
+	// targetPodIP is the restore Pod's IP, which restored TCP connections
+	// move to.
+	targetPodIP string
 }
 
 const (
@@ -639,7 +646,8 @@ func (w *NodeController) preflightRestore(ctx context.Context, pod *corev1.Pod) 
 	if err := w.preflightCompatibility(ctx, pod, artifact, mappings, skipCompatCheck); err != nil {
 		return nil, err
 	}
-	if err := w.preflightPodIP(pod); err != nil {
+	podIP, err := w.preflightPodIP(ctx, pod)
+	if err != nil {
 		return nil, err
 	}
 	// The post-restore action is checked against the Pod spec here, so an
@@ -655,16 +663,8 @@ func (w *NodeController) preflightRestore(ctx context.Context, pod *corev1.Pod) 
 		skipCompatCheck:   skipCompatCheck,
 		postRestore:       postRestore,
 		postRestorePeriod: postRestorePeriod,
+		podIP:             podIP,
 	}, nil
-}
-
-// preflightPodIP keeps a restore that restores established TCP connections
-// pending until the Pod has its IP address.
-func (w *NodeController) preflightPodIP(pod *corev1.Pod) error {
-	if w.config.CRIU.TcpEstablished && pod.Status.PodIP == "" {
-		return newRestorePendingError("PodIPPending", fmt.Sprintf("Waiting for restore Pod %s/%s to receive an IP address", pod.Namespace, pod.Name))
-	}
-	return nil
 }
 
 func (w *NodeController) getPodSnapshotFromPod(ctx context.Context, pod *corev1.Pod) (*snapshotv1alpha1.PodSnapshot, error) {
@@ -1295,6 +1295,8 @@ func (w *NodeController) newRestoreOperation(
 		containerID:       containerID,
 		startedAt:         startedAt,
 		log:               w.log.WithValues("pod", podKey, "snapshot", artifact.SnapshotName, "content_uid", artifact.ContentUID, "source_container", artifact.SourceContainerName, "destination_container", destination, "container_id", containerID),
+		// The API's IP comes first, as in the preflight.
+		targetPodIP: cmp.Or(pod.Status.PodIP, plan.podIP),
 	}
 }
 
@@ -1307,7 +1309,7 @@ func (op *restoreOperation) executeRestore(ctx context.Context) (executor.Restor
 		StartedAt:                   op.startedAt,
 		PodName:                     op.pod.Name,
 		PodNamespace:                op.pod.Namespace,
-		TargetPodIP:                 op.pod.Status.PodIP,
+		TargetPodIP:                 op.targetPodIP,
 		ArtifactContainerName:       op.artifact.SourceContainerName,
 		DestinationContainerName:    op.destination,
 		SkipCompatCheck:             op.skipCompatCheck,
