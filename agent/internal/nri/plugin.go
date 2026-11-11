@@ -52,8 +52,8 @@ const (
 	// drops the connection in between would hold the agent there forever.
 	registerTimeout = 30 * time.Second
 
-	// lookupTimeout bounds the API read for Pods without a container map. It
-	// runs inside the runtime's CreateContainer call. NRI gives that whole call
+	// lookupTimeout bounds the API read for restore-from Pods without a
+	// container map. It runs inside the runtime's CreateContainer call. NRI gives that whole call
 	// 2 s by default, and drops a plugin that takes longer, so the read gets
 	// 1 s and copying the proxy the rest.
 	lookupTimeout = time.Second
@@ -213,7 +213,7 @@ func dropsArgs(nriVersion string) bool {
 // retries it: running the image's own command instead would start the
 // workload from scratch in a container the agent is about to restore into.
 func (p *Plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	if _, ok := pod.GetAnnotations()[podcontract.RestoreFromAnnotation]; !ok {
+	if !podcontract.RestoreRequested(pod.GetAnnotations()) {
 		return nil, nil, nil
 	}
 	if p.hostNamespace != "" && pod.GetNamespace() != p.hostNamespace {

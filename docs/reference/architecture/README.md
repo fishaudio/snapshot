@@ -77,6 +77,7 @@ result onto the snapshot.
 
 Restore has no resource of its own. A pod requests one with the
 `nvidia.com/restore-from` annotation naming a `PodSnapshot` in its namespace,
+or `nvidia.com/restore-from-map` naming one per destination container,
 plus the rest of the [Restore Pod contract](../restore-pod-contract.md). The
 agent reports progress on the `nvidia.com/Restored` pod condition.
 

@@ -88,6 +88,19 @@ Every mapping source must match the one container captured by the
 same-name single-container restore remains unchanged. Unrelated platform
 annotations are preserved.
 
+To restore containers from different `PodSnapshot`s, set
+`nvidia.com/restore-from-map` in the manifest and omit `--snapshot`:
+
+```yaml
+metadata:
+  annotations:
+    nvidia.com/restore-from-map: prefill=prefill-snapshot,decode=decode-snapshot
+```
+
+`snapshotctl` checks that each named `PodSnapshot` exists and checkpoints one
+container, and prints them comma-separated as `pod_snapshot`. See the
+[restore Pod contract](../../../docs/reference/restore-pod-contract.md#restore-from-several-podsnapshots).
+
 ## Commands
 
 Checkpoint from a manifest:

@@ -34,6 +34,15 @@ commit-level history for each release is on its
 
 ### Added
 
+- A restore Pod can restore its containers from different `PodSnapshot`s with
+  the `nvidia.com/restore-from-map` annotation, for example the prefill and
+  decode containers of a disaggregated serving unit, each checkpointed on its
+  own. The node agent restores them in parallel. Go integrations set
+  `podcontract.Request.SnapshotMappings`, and `snapshotctl restore` reads the
+  annotation from its manifest. Existing restore Pods are unchanged; upgrade the
+  node agent before creating such Pods. See
+  [Restore from several PodSnapshots](docs/reference/restore-pod-contract.md#restore-from-several-podsnapshots).
+
 - Lifecycle hooks: `PodSnapshot.spec.containers` and
   `SnapshotJob.spec.podSnapshotTemplate.containers` can set a
   `checkpointReadinessProbe`, which decides when to checkpoint instead of the

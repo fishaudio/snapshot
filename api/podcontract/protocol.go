@@ -23,6 +23,19 @@ const (
 	// uses the captured container name as the destination.
 	RestoreContainerMapAnnotation = "nvidia.com/restore-container-map"
 
+	// RestoreFromMapAnnotation restores each destination container from its
+	// own PodSnapshot in the Pod's namespace. Its value is a comma-separated
+	// list of destination=snapshot pairs: the single captured container of
+	// each named PodSnapshot restores into that destination. A Pod sets it
+	// instead of RestoreFromAnnotation and RestoreContainerMapAnnotation, never
+	// together with either.
+	RestoreFromMapAnnotation = "nvidia.com/restore-from-map"
+
+	// MaxSnapshotMappings is the most destinations one RestoreFromMapAnnotation
+	// names. Each one is a restore that the node agent runs in parallel with
+	// the others.
+	MaxSnapshotMappings = 8
+
 	// SkipCompatCheckAnnotation disables compatibility checks for one restore.
 	SkipCompatCheckAnnotation = "nvidia.com/snapshot-skip-compat-check"
 
@@ -184,9 +197,27 @@ type ContainerMapping struct {
 	Destination string
 }
 
+// SnapshotMapping names the PodSnapshot that one restore destination
+// container restores from.
+type SnapshotMapping struct {
+	Destination  string
+	SnapshotName string
+}
+
+// RestoreRequested reports whether annotations ask for a restore, with either
+// the restore-from or the restore-from-map annotation.
+func RestoreRequested(annotations map[string]string) bool {
+	_, single := annotations[RestoreFromAnnotation]
+	_, mapped := annotations[RestoreFromMapAnnotation]
+	return single || mapped
+}
+
 // GetRestoreFromSnapshotName returns the same-namespace PodSnapshot named by
-// the restore-from annotation.
+// the restore-from annotation. It fails when the Pod also sets restore-from-map.
 func GetRestoreFromSnapshotName(annotations map[string]string) (string, error) {
+	if err := rejectMixedRestoreAnnotations(annotations); err != nil {
+		return "", err
+	}
 	return validateRestoreFromSnapshotName(annotations[RestoreFromAnnotation])
 }
 
@@ -263,6 +294,85 @@ func ValidateContainerMappings(mappings []ContainerMapping, capturedSource strin
 			return fmt.Errorf("duplicate restore destination container %q", destination)
 		}
 		destinations[destination] = struct{}{}
+	}
+	return nil
+}
+
+// SnapshotMappingsFromAnnotations parses and validates the restore-from-map
+// annotation. It returns nil without the annotation. A Pod that sets it
+// together with restore-from or restore-container-map is rejected.
+func SnapshotMappingsFromAnnotations(annotations map[string]string) ([]SnapshotMapping, error) {
+	raw, ok := annotations[RestoreFromMapAnnotation]
+	if !ok {
+		return nil, nil
+	}
+	if err := rejectMixedRestoreAnnotations(annotations); err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	mappings := make([]SnapshotMapping, 0, len(parts))
+	for _, part := range parts {
+		pair := strings.Split(part, "=")
+		if len(pair) != 2 {
+			return nil, fmt.Errorf(
+				"invalid %s entry %q: expected destination=snapshot",
+				RestoreFromMapAnnotation,
+				strings.TrimSpace(part),
+			)
+		}
+		mappings = append(mappings, SnapshotMapping{
+			Destination:  strings.TrimSpace(pair[0]),
+			SnapshotName: strings.TrimSpace(pair[1]),
+		})
+	}
+	if err := ValidateSnapshotMappings(mappings); err != nil {
+		return nil, err
+	}
+	return mappings, nil
+}
+
+// ValidateSnapshotMappings enforces the restore-from-map contract: one to
+// MaxSnapshotMappings destinations, each named once. Several destinations may
+// restore from the same PodSnapshot.
+func ValidateSnapshotMappings(mappings []SnapshotMapping) error {
+	if len(mappings) == 0 {
+		return fmt.Errorf("%s must map at least one destination container", RestoreFromMapAnnotation)
+	}
+	if len(mappings) > MaxSnapshotMappings {
+		return fmt.Errorf("%s maps %d destination containers; the limit is %d",
+			RestoreFromMapAnnotation, len(mappings), MaxSnapshotMappings)
+	}
+	destinations := make(map[string]struct{}, len(mappings))
+	for _, mapping := range mappings {
+		if errs := validation.IsDNS1123Label(mapping.Destination); len(errs) != 0 {
+			return fmt.Errorf("invalid restore destination container %q: %s", mapping.Destination, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsDNS1123Subdomain(mapping.SnapshotName); len(errs) != 0 {
+			return fmt.Errorf(
+				"restore destination container %q names invalid PodSnapshot %q: %s",
+				mapping.Destination,
+				mapping.SnapshotName,
+				strings.Join(errs, "; "),
+			)
+		}
+		if _, duplicate := destinations[mapping.Destination]; duplicate {
+			return fmt.Errorf("duplicate restore destination container %q", mapping.Destination)
+		}
+		destinations[mapping.Destination] = struct{}{}
+	}
+	return nil
+}
+
+// rejectMixedRestoreAnnotations refuses a Pod that names its PodSnapshots both
+// ways, so no reader has to choose between them.
+func rejectMixedRestoreAnnotations(annotations map[string]string) error {
+	if _, mapped := annotations[RestoreFromMapAnnotation]; !mapped {
+		return nil
+	}
+	for _, name := range []string{RestoreFromAnnotation, RestoreContainerMapAnnotation} {
+		if _, found := annotations[name]; found {
+			return fmt.Errorf("%s cannot be combined with %s", RestoreFromMapAnnotation, name)
+		}
 	}
 	return nil
 }

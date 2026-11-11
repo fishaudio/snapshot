@@ -35,6 +35,7 @@ func NewSourceJob(podTemplate *corev1.PodTemplateSpec, opts SourceJobOptions) (*
 	for _, annotation := range []string{
 		podcontract.RestoreFromAnnotation,
 		podcontract.RestoreContainerMapAnnotation,
+		podcontract.RestoreFromMapAnnotation,
 	} {
 		if _, restoreRequested := podTemplate.Annotations[annotation]; restoreRequested {
 			return nil, fmt.Errorf("source job pod template must not set %s", annotation)
