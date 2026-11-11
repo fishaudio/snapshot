@@ -37,8 +37,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # The runner's resolv.conf names systemd-resolved on 127.0.0.53, which the
+      # BuildKit container cannot reach, so its RUN steps fall back to Docker's
+      # 8.8.8.8 and 8.8.4.4. Those failed to resolve the Ubuntu archive in every
+      # apt-get here. Give BuildKit the resolvers systemd-resolved itself uses.
+      - name: Point BuildKit at the runner's DNS
+        run: |
+          set -euo pipefail
+          ns=$(awk '/^nameserver/ {printf "%s\"%s\"", (n++ ? ", " : ""), $2}' /run/systemd/resolve/resolv.conf)
+          test -n "${ns}"
+          printf '[dns]\n  nameservers = [%s]\n' "${ns}" | tee "${RUNNER_TEMP}/buildkitd.toml"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: ${{ runner.temp }}/buildkitd.toml
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
