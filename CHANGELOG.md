@@ -179,6 +179,15 @@ commit-level history for each release is on its
   such as UCX shared-memory endpoints (#802), work after a restore. Only
   checkpoints taken after the upgrade get it; take older ones again.
 
+### Fixed
+
+- Several PodSnapshots of one Pod, such as the prefill and decode containers
+  of a disaggregated serving unit, can be taken one after the other. The
+  second capture no longer fails, and no longer kills the Pod's containers,
+  because the container the first capture dumped has exited non-zero: the
+  dump ends its target. A container whose own capture failed still fails
+  the next capture.
+
 ### Deprecated
 
 - `SNAPSHOT_RESTORE_STANDBY` (`podcontract.RestoreStandbyModeEnv`): restore
