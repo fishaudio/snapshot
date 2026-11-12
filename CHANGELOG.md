@@ -161,6 +161,14 @@ commit-level history for each release is on its
   Snapshot never injected it. The `DYN_SNAPSHOT_RESTORE_STANDBY` alias is still
   removed in the next release.
 
+### Fixed
+
+- A Pod's containers can be checkpointed one after the other, one PodSnapshot
+  each, such as the prefill and decode containers of a disaggregated serving
+  unit. The second checkpoint no longer fails on the target container that the
+  first checkpoint ended, and no longer kills the Pod's other containers. A
+  container whose own checkpoint failed still fails the next checkpoint.
+
 ## [0.1.0] - 2026-09-06
 
 First release. Snapshot checkpoints a fully initialized GPU pod — running
