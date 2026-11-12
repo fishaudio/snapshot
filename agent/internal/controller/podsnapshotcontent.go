@@ -356,7 +356,7 @@ func classifySourcePodLiveness(pod *corev1.Pod) (string, string) {
 // pod this work order owns — the sweep kills every running container in it. Init containers
 // (pod.Status.InitContainerStatuses) are intentionally out of scope.
 func (w *NodeController) failCheckpointOnContainerExit(ctx context.Context, content *snapshotv1alpha1.PodSnapshotContent, pod *corev1.Pod) (bool, error) {
-	failed := failedCheckpointContainer(pod)
+	failed := failedCheckpointContainer(pod, w.containersDumpedByOthers(content, pod))
 	if failed == nil {
 		return false, nil
 	}
@@ -377,15 +377,39 @@ func (w *NodeController) failCheckpointOnContainerExit(ctx context.Context, cont
 }
 
 // failedCheckpointContainer returns the first checkpoint container that terminated non-zero, or
-// nil. Init containers (pod.Status.InitContainerStatuses) are intentionally out of scope.
-func failedCheckpointContainer(pod *corev1.Pod) *corev1.ContainerStatus {
+// nil, skipping the containers in dumped. Init containers (pod.Status.InitContainerStatuses) are
+// intentionally out of scope.
+func failedCheckpointContainer(pod *corev1.Pod, dumped map[string]bool) *corev1.ContainerStatus {
 	for i := range pod.Status.ContainerStatuses {
 		cs := &pod.Status.ContainerStatuses[i]
-		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 && !dumped[cs.Name] {
 			return cs
 		}
 	}
 	return nil
+}
+
+// containersDumpedByOthers returns the containers of this pod incarnation that another work order
+// has already captured (its content is Ready). The dump ends its target, so that container's
+// non-zero exit is how its capture finished, not a crash: when a pod's containers are captured one
+// work order after another, such as the prefill and decode containers of a disaggregated unit, the
+// next capture must not fail on it. A container whose capture failed is not skipped.
+func (w *NodeController) containersDumpedByOthers(content *snapshotv1alpha1.PodSnapshotContent, pod *corev1.Pod) map[string]bool {
+	objs, err := w.contentIndexer.ByIndex(podRefIndex, pod.Namespace+"/"+pod.Name)
+	if err != nil {
+		return nil
+	}
+	dumped := map[string]bool{}
+	for _, obj := range objs {
+		other, ok := contentFromInformerObj(obj)
+		if !ok || other.Name == content.Name || other.Spec.Source.PodRef.UID != pod.UID || !isContentReady(other) {
+			continue
+		}
+		for _, name := range other.Spec.Source.PodRef.Containers {
+			dumped[name] = true
+		}
+	}
+	return dumped
 }
 
 // preflightCuInterpose reads the explicit opt-in. An opted-in target must also start

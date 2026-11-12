@@ -469,6 +469,51 @@ func TestFailCheckpointOnContainerExit_IgnoresCleanExit(t *testing.T) {
 	assert.False(t, handled)
 }
 
+// sequentialCaptures returns the work orders of a pod whose prefill and decode containers are
+// captured one after the other: the prefill capture has finished with firstCondition, and its
+// dump ended the prefill container with exit 137 while decode still runs.
+func sequentialCaptures(firstCondition string) (*snapshotv1alpha1.PodSnapshotContent, *snapshotv1alpha1.PodSnapshotContent, *corev1.Pod) {
+	prefill := makeWorkOrder("podsnapshotcontent-prefill", "node-a", "prefill")
+	prefill.Spec.Source.PodRef.Containers = []string{"prefill"}
+	prefill.Status.Conditions = []metav1.Condition{{Type: firstCondition, Status: metav1.ConditionTrue,
+		Reason: "Test", LastTransitionTime: metav1.Now()}}
+	decode := makeWorkOrder("podsnapshotcontent-decode", "node-a", "decode")
+	decode.Spec.Source.PodRef.Containers = []string{"decode"}
+	pod := makeSourcePod()
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "prefill", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"}}},
+		{Name: "decode", Ready: true, ContainerID: "containerd://decode",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+	}
+	return prefill, decode, pod
+}
+
+// The dump ends its target, so the next capture of the same pod must not read that exit as a crash.
+func TestFailCheckpointOnContainerExit_IgnoresContainerAnotherWorkOrderCaptured(t *testing.T) {
+	prefill, decode, pod := sequentialCaptures(snapshotv1alpha1.PodSnapshotConditionReady)
+	rt := &fakeRuntime{}
+	w := makeNodeController(t, &fakeCheckpointer{}, prefill, decode)
+	w.runtime = rt
+
+	handled, err := w.failCheckpointOnContainerExit(context.Background(), decode, pod)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Empty(t, rt.resolvedContainerIDs)
+}
+
+// A container whose capture failed may have crashed: the next capture still fails on it.
+func TestFailCheckpointOnContainerExit_StillFailsOnContainerWhoseCaptureFailed(t *testing.T) {
+	prefill, decode, pod := sequentialCaptures(snapshotv1alpha1.PodSnapshotConditionFailed)
+	w := makeNodeController(t, &fakeCheckpointer{}, prefill, decode)
+
+	handled, err := w.failCheckpointOnContainerExit(context.Background(), decode, pod)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	cond := meta.FindStatusCondition(getContent(t, w, decode.Name).Status.Conditions, snapshotv1alpha1.PodSnapshotConditionFailed)
+	require.NotNil(t, cond)
+	assert.Contains(t, cond.Message, `"prefill"`)
+}
+
 // TestReconcileCapture_NonOwnerNeverKillsTheOwnersSource is the regression behind moving the
 // ownership guard above the unstick sweep: mid-dump the target shows a non-zero exit, and a
 // sibling reaching that sweep would SIGKILL the container the owner is still dumping.
