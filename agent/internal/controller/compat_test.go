@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -440,11 +441,12 @@ func TestSkipCompatCheckTurnsOffTheGates(t *testing.T) {
 		}
 	})
 
-	// The annotation has to reach a pod the gate already turned down, or the
-	// only way out of a wrong refusal is deleting and recreating the pod.
-	t.Run("it reopens a pod that was already refused", func(t *testing.T) {
+	// A refusal ends the destination containers, which then start without a
+	// restore, so the annotation does not reopen a pod that was already
+	// refused: retrying with it takes a new pod, as after any failed restore.
+	t.Run("it does not reopen a pod that was already refused", func(t *testing.T) {
 		r := newGatedRestore(t, mismatch)
-		stopEarly(r)
+		r.controller.restoreFn = noRestoreExpected(t)
 
 		r.reconcile(t)
 		require.Len(t, r.events(t, podcontract.RestoreReasonIncompatible), 1, "the gate did not refuse the restore")
@@ -457,11 +459,14 @@ func TestSkipCompatCheckTurnsOffTheGates(t *testing.T) {
 		})
 		r.pod.Annotations[podcontract.SkipCompatCheckAnnotation] = "true"
 		r.comparison.calls = nil
+		// As after an agent restart: only the condition remembers the refusal.
+		r.controller.handledRestores.Delete(string(r.pod.UID))
 
 		r.reconcile(t)
 
-		assert.Empty(t, r.comparison.calls, "the reopened restore was compared anyway")
-		assert.Len(t, r.events(t, podcontract.RestoreReasonIncompatible), 1, "the reopened restore was refused again")
+		assert.Empty(t, r.comparison.calls, "the refused restore was compared again")
+		assert.Len(t, r.events(t, podcontract.RestoreReasonIncompatible), 1, "the refused restore was refused again")
+		assert.Len(t, r.events(t, restoreAlreadyFailedReason), 1)
 	})
 }
 
@@ -497,16 +502,23 @@ func TestRefusalIsLoggedWithTheSameReasonAtBothGates(t *testing.T) {
 	})
 }
 
-// A refusal from the second gate is not a CRIU failure, so it neither reports
-// one nor kills the placeholder: killing it would restart the container straight
-// back into the same answer.
-func TestRunRestoreTreatsIncompatibleAsTerminal(t *testing.T) {
+// A refusal from the second gate is not a CRIU failure, so it does not report
+// one. It ends the placeholder like one, restore-failed first and then the
+// kill, so the container starts without a restore at once instead of waiting
+// for one that will not come.
+func TestRunRestoreEndsTheDestinationOfAnIncompatibleRestore(t *testing.T) {
 	r := newGatedRestore(t)
-	rt := &fakeRuntime{}
-	r.controller.runtime = rt
-	sentinels := 0
-	r.controller.writeControlSentinelFn = func(int, string, []byte) error {
-		sentinels++
+	r.controller.runtime = &fakeRuntime{resolveContainerPID: 4242}
+	var calls []string
+	r.controller.writeControlSentinelFn = func(pid int, name string, _ []byte) error {
+		assert.Equal(t, 4242, pid)
+		calls = append(calls, "write "+name)
+		return nil
+	}
+	r.controller.sendSignalFn = func(_ logr.Logger, pid int, sig syscall.Signal, _ string) error {
+		assert.Equal(t, 4242, pid)
+		assert.Equal(t, syscall.SIGKILL, sig)
+		calls = append(calls, "kill")
 		return nil
 	}
 	r.controller.restoreFn = refuseWith(compat.Mismatch{Check: "cpu-arch", Source: "amd64", Target: "arm64"})
@@ -515,8 +527,10 @@ func TestRunRestoreTreatsIncompatibleAsTerminal(t *testing.T) {
 
 	assert.False(t, requeue, "a refusal asked to be driven again")
 	assert.Empty(t, r.events(t, podcontract.RestoreReasonFailed), "refusal reported itself as a restore failure")
-	assert.Zero(t, sentinels, "refusal wrote restore-complete or restore-failed")
-	assert.Empty(t, rt.resolvedContainerIDs, "refusal reached the placeholder kill path")
+	assert.Equal(t, []string{"write " + podcontract.RestoreFailedFile, "kill"}, calls)
+	condition := r.condition(t)
+	assert.Equal(t, podcontract.RestoreReasonIncompatible, condition.Reason)
+	assert.Equal(t, refusalMessage("cpu-arch: source amd64, target arm64"), condition.Message)
 }
 
 // The gate runs in preflight, before the restore is entered at all, so a refusal

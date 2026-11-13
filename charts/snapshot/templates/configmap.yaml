@@ -99,6 +99,7 @@ data:
     restore:
       timeoutSeconds: {{ .Values.config.restore.timeoutSeconds }}
       restoreTimeoutSeconds: {{ .Values.config.restore.timeoutSeconds }}
+      snapshotWaitSeconds: {{ .Values.config.restore.snapshotWaitSeconds | int64 }}
       skipCompatCheck: {{ .Values.config.restore.skipCompatCheck }}
 
     criu:

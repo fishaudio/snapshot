@@ -23,6 +23,15 @@
               "maximum": 1024
             }
           }
+        },
+        "restore": {
+          "type": "object",
+          "properties": {
+            "snapshotWaitSeconds": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
         }
       }
     },

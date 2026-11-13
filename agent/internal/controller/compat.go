@@ -18,21 +18,17 @@ import (
 // refuseRestore records a restore this node will not attempt. It is terminal
 // like any other restore failure and reports through the same condition, with
 // its own reason so an operator can tell a checkpoint that cannot run here from
-// one that tried and broke. source names the PodSnapshot that a restore-from-map
-// Pod was refused for; it is empty for a restore-from Pod.
+// one that tried and broke. Like a failure, it ends the destination containers,
+// so they start without a restore at once. source names the PodSnapshot that a
+// restore-from-map Pod was refused for; it is empty for a restore-from Pod.
 func (w *NodeController) refuseRestore(ctx context.Context, pod *corev1.Pod, incompatible *compat.IncompatibleError, source string) bool {
 	reason := compat.Reasons(incompatible.Mismatches)
 	if source != "" {
 		reason = source + ": " + reason
 	}
 	w.logRestoreRefusal(pod, incompatible, reason)
-	return w.finishRestore(
-		ctx,
-		pod,
-		corev1.ConditionFalse,
-		podcontract.RestoreReasonIncompatible,
-		refusalMessage(reason),
-	) != nil
+	return w.endRestore(ctx, pod, w.endableDestinations(ctx, pod),
+		podcontract.RestoreReasonIncompatible, refusalMessage(reason))
 }
 
 // refusalMessage puts a sentence around the mismatches, which on their own read
@@ -50,22 +46,6 @@ func (w *NodeController) logRestoreRefusal(pod *corev1.Pod, incompatible *compat
 		"gate", string(incompatible.Gate),
 		"reason", reason,
 	)
-}
-
-// restoreRefused reports a pod whose restore the gates turned down, as opposed
-// to one that was attempted and failed.
-func restoreRefused(pod *corev1.Pod) bool {
-	condition := findRestoredCondition(pod)
-	return condition != nil &&
-		condition.Status == corev1.ConditionFalse &&
-		condition.Reason == podcontract.RestoreReasonIncompatible
-}
-
-// skipRequestedAfterRefusal reports a pod that the gates turned down and that
-// has since asked for them to be skipped. Nothing else reopens a terminal
-// restore, which is what makes the skip request an escape hatch and not a retry.
-func (w *NodeController) skipRequestedAfterRefusal(pod *corev1.Pod) bool {
-	return restoreRefused(pod) && w.skipCompatCheckRequested(pod)
 }
 
 // podEnvironment reads what one container of a pod runs as and is allowed. It serves

@@ -905,6 +905,13 @@ SMALLER_MEMORY_LIMIT = "1Gi"
 RESTORE_RESYNC_SECONDS = 30
 
 
+def assert_ended_without_restore(config: k8s.E2EConfig, run: snap.TestRun) -> None:
+    """A refusal costs no CRIU work, and ends the placeholder like a failed
+    restore: restore-failed, then the kill. The proxy exits 112 when it sees
+    restore-failed before the kill lands, 137 otherwise."""
+    assert snap.wait_for_container_exit(config.namespace, run.restore_pod) in {112, 137}
+
+
 @pytest.mark.snapshot_failure
 @pytest.mark.gpu
 def test_refused_restore_says_why_and_does_no_criu_work(
@@ -941,9 +948,7 @@ def test_refused_restore_says_why_and_does_no_criu_work(
         assert restore_event_count(config.namespace, run.restore_pod, "RestoreIncompatible") == 1
         assert "RestoreFailed" not in restore_event_reasons(config.namespace, run.restore_pod)
 
-        # The placeholder is still the placeholder: a refusal costs no CRIU work,
-        # so the workload never sees restore-complete.
-        assert not snap.file_present(config.namespace, run.restore_pod, snap.RESTORE_DONE)
+        assert_ended_without_restore(config, run)
     except Exception:
         snap.debug_dump(config, run)
         raise
@@ -988,9 +993,7 @@ def test_refused_cpu_restore_says_why_and_does_no_criu_work(
         assert restore_event_count(config.namespace, run.restore_pod, "RestoreIncompatible") == 1
         assert "RestoreFailed" not in restore_event_reasons(config.namespace, run.restore_pod)
 
-        # The placeholder is still the placeholder: a refusal costs no CRIU work,
-        # so the workload never sees restore-complete.
-        assert not snap.file_present(config.namespace, run.restore_pod, snap.RESTORE_DONE)
+        assert_ended_without_restore(config, run)
     except Exception:
         snap.debug_dump(config, run)
         raise
@@ -1029,7 +1032,7 @@ def test_restore_onto_a_cpu_missing_an_instruction_set_is_refused(
         assert f"cpu-features: source {missing}, target missing" in refusal.message
         assert_restore_events(config.namespace, run.restore_pod, {"RestoreIncompatible"})
         assert "RestoreFailed" not in restore_event_reasons(config.namespace, run.restore_pod)
-        assert not snap.file_present(config.namespace, run.restore_pod, snap.RESTORE_DONE)
+        assert_ended_without_restore(config, run)
     except Exception:
         snap.debug_dump(config, run)
         raise
@@ -1158,7 +1161,7 @@ def test_restore_into_a_pod_missing_a_mount_is_refused_by_path(
 
         assert_restore_events(config.namespace, run.restore_pod, {"RestoreIncompatible"})
         assert "RestoreFailed" not in restore_event_reasons(config.namespace, run.restore_pod)
-        assert not snap.file_present(config.namespace, run.restore_pod, snap.RESTORE_DONE)
+        assert_ended_without_restore(config, run)
     except Exception:
         snap.debug_dump(config, run)
         raise
