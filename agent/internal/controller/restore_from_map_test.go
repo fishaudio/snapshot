@@ -562,6 +562,9 @@ func TestReconcileRestoreFromMapRecoversEachDestinationOnItsOwn(t *testing.T) {
 	w := makeFanInController(t, pod, sources)
 	w.runtime = &containerPIDRuntime{fakeRuntime: &fakeRuntime{}, pids: map[string]int{"prefill-id": 100, "decode-id": 200}}
 	w.controlSentinelExistsFn = func(pid int, name string) (bool, error) {
+		if name == podcontract.RestoreFailedFile {
+			return false, nil
+		}
 		assert.Equal(t, podcontract.RestoreCompleteFile, name)
 		return pid == 100, nil
 	}

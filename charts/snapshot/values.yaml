@@ -336,6 +336,12 @@ config:
   restore:
     # Maximum seconds to allow a restore attempt before the agent marks it failed
     timeoutSeconds: 7200
+    # Seconds a restore Pod waits for its PodSnapshots to be ready to restore,
+    # counted from when its first destination container started. Past it the
+    # agent ends the restore as failed, and the destination containers start
+    # without it at once. Keep it below a workload's own wait for the restore.
+    # 0 waits for as long as it takes.
+    snapshotWaitSeconds: 60
     # Skip the restore compatibility check on every restore this agent handles.
     # The gate refuses a restore whose snapshot was taken somewhere the
     # target node cannot reproduce; turning it off means those restores are

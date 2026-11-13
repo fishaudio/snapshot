@@ -54,6 +54,27 @@ tests:
       - failedTemplate:
           errorPattern: "storage.pvc.basePath is fixed at /checkpoints"
 
+  - it: bounds the wait for a restore's snapshot by default
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'snapshotWaitSeconds: 60\n'
+
+  - it: renders an unbounded wait for a restore's snapshot
+    set:
+      config.restore.snapshotWaitSeconds: 0
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'snapshotWaitSeconds: 0\n'
+
+  - it: rejects a negative wait for a restore's snapshot
+    set:
+      config.restore.snapshotWaitSeconds: -1
+    asserts:
+      - failedTemplate:
+          errorPattern: "snapshotWaitSeconds"
+
   - it: keeps the restore compatibility gate on by default
     asserts:
       - matchRegex:

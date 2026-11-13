@@ -150,9 +150,21 @@ func (c *CheckpointSpec) Validate() error {
 	return nil
 }
 
+// DefaultSnapshotWaitSeconds bounds a restore's wait for its snapshot for a config written before
+// the field existed.
+const DefaultSnapshotWaitSeconds = 60
+
 // RestoreSpec holds settings for the CRIU restore process.
 type RestoreSpec struct {
 	TimeoutSeconds int `yaml:"timeoutSeconds"`
+
+	// SnapshotWaitSeconds bounds how long a restore Pod waits for its
+	// PodSnapshots to be ready to restore, counted from when its first
+	// destination container started. Past it the agent ends the restore the
+	// way a failed one ends, and the destination containers start without it.
+	// A pointer so absent and zero are distinguishable: absent is
+	// DefaultSnapshotWaitSeconds, and zero waits for as long as it takes.
+	SnapshotWaitSeconds *int `yaml:"snapshotWaitSeconds"`
 
 	// SkipCompatCheck turns the restore compatibility gate off for every
 	// restore this agent handles. It is the per-node escape hatch, for a
@@ -167,6 +179,14 @@ func (c *RestoreSpec) RestoreTimeout() time.Duration {
 	return time.Duration(c.TimeoutSeconds) * time.Second
 }
 
+// SnapshotWait bounds a restore's wait for its snapshot; zero means no bound.
+func (c *RestoreSpec) SnapshotWait() time.Duration {
+	if c.SnapshotWaitSeconds == nil {
+		return DefaultSnapshotWaitSeconds * time.Second
+	}
+	return time.Duration(max(*c.SnapshotWaitSeconds, 0)) * time.Second
+}
+
 func (c *RestoreSpec) Validate() error {
 	if c.TimeoutSeconds <= 0 {
 		return &ConfigError{Field: "restore.timeoutSeconds", Message: "restore.timeoutSeconds must be greater than zero"}
@@ -175,6 +195,17 @@ func (c *RestoreSpec) Validate() error {
 		return &ConfigError{
 			Field:   "restore.timeoutSeconds",
 			Message: fmt.Sprintf("restore.timeoutSeconds must not exceed %d", maxTimeoutSeconds),
+		}
+	}
+	if wait := c.SnapshotWaitSeconds; wait != nil {
+		if *wait < 0 {
+			return &ConfigError{Field: "restore.snapshotWaitSeconds", Message: "restore.snapshotWaitSeconds must not be negative"}
+		}
+		if int64(*wait) > maxTimeoutSeconds {
+			return &ConfigError{
+				Field:   "restore.snapshotWaitSeconds",
+				Message: fmt.Sprintf("restore.snapshotWaitSeconds must not exceed %d", maxTimeoutSeconds),
+			}
 		}
 	}
 	return nil

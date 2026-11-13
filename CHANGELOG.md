@@ -54,6 +54,12 @@ commit-level history for each release is on its
   it creates. Restores then run without the restore proxy, and restore Pods
   need an inert command. Default `true`, unchanged. See
   [Nodes without the restore proxy](docs/reference/restore-pod-contract.md#nodes-without-the-restore-proxy).
+- `config.restore.snapshotWaitSeconds` bounds how long a restore Pod waits for
+  its PodSnapshots to be ready to restore, counted from when its first
+  destination container started. Past it the restore fails, and the
+  destination containers start without it at once. Default `60`; `0` waits
+  for as long as it takes, as before. See
+  [Agent config](docs/reference/api.md#agent-config-config).
 
 - Lifecycle hooks: `PodSnapshot.spec.containers` and
   `SnapshotJob.spec.podSnapshotTemplate.containers` can set a
@@ -98,6 +104,14 @@ commit-level history for each release is on its
 
 ### Changed
 
+- A restore that the compatibility checks refuse, or whose preflight fails,
+  now ends its destination containers the way a failed restore does: the agent
+  writes `restore-failed` and kills each one, so it starts without a restore at
+  once instead of waiting for one. The condition reasons are unchanged. Adding
+  `nvidia.com/snapshot-skip-compat-check` to a refused Pod no longer reopens
+  its restore; create a new Pod with the annotation. The agent never restores
+  into a container whose control directory holds `restore-failed`. See
+  [Restore Pod contract](docs/reference/restore-pod-contract.md).
 - With `config.criu.tcpEstablished`, the default, a restore no longer waits
   for kubelet to publish the restore Pod's IP address, which can take up to a
   second after the Pod starts. While the API has none, the node agent reads it
