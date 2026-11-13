@@ -137,6 +137,34 @@ func TestTimeoutsAcceptTheLargestRepresentableValue(t *testing.T) {
 
 	restore := RestoreSpec{TimeoutSeconds: limit}
 	require.NoError(t, restore.Validate())
+
+	waited := RestoreSpec{TimeoutSeconds: 60, SnapshotWaitSeconds: &limit}
+	require.NoError(t, waited.Validate())
+}
+
+// A ConfigMap that predates restore.snapshotWaitSeconds still bounds the wait;
+// an explicit zero keeps the unbounded wait of earlier agents.
+func TestRestoreSpecSnapshotWait(t *testing.T) {
+	for document, want := range map[string]time.Duration{
+		"timeoutSeconds: 60\n":                          DefaultSnapshotWaitSeconds * time.Second,
+		"timeoutSeconds: 60\nsnapshotWaitSeconds: 45\n": 45 * time.Second,
+		"timeoutSeconds: 60\nsnapshotWaitSeconds: 0\n":  0,
+	} {
+		var spec RestoreSpec
+		require.NoError(t, yaml.Unmarshal([]byte(document), &spec))
+
+		require.NoError(t, spec.Validate(), document)
+		assert.Equal(t, want, spec.SnapshotWait(), document)
+	}
+}
+
+func TestRestoreSpecRejectsAnInvalidSnapshotWait(t *testing.T) {
+	negative := -1
+	overflow := int(maxTimeoutSeconds) + 1
+	for _, wait := range []*int{&negative, &overflow} {
+		spec := RestoreSpec{TimeoutSeconds: 60, SnapshotWaitSeconds: wait}
+		require.ErrorContains(t, spec.Validate(), "restore.snapshotWaitSeconds", *wait)
+	}
 }
 
 // A ConfigMap that predates the compression keys leaves them unset, so the

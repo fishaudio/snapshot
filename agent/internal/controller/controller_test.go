@@ -1544,6 +1544,9 @@ func TestRestoreStatusRetryUsesCompletionSentinelWithoutReplayingRestore(t *test
 	}
 	w.controlSentinelExistsFn = func(pid int, name string) (bool, error) {
 		assert.Equal(t, 4242, pid)
+		if name == podcontract.RestoreFailedFile {
+			return false, nil
+		}
 		assert.Equal(t, podcontract.RestoreCompleteFile, name)
 		return sentinelWritten, nil
 	}

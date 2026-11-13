@@ -173,7 +173,10 @@ restore time into:
 
 A pod gets exactly one restore. On failure the agent writes `restore-failed`,
 kills the destination container, and reports the reason on the pod condition;
-restoring again means creating a new pod.
+restoring again means creating a new pod. A restore that is refused, or whose
+snapshot is not ready within `config.restore.snapshotWaitSeconds`, ends the
+same way, and no restore ever runs into a container that holds
+`restore-failed`.
 
 ```mermaid
 sequenceDiagram

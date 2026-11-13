@@ -177,6 +177,15 @@ and its proxy exits with code 112. With `restartPolicy: Always` or `OnFailure`,
 as in a Deployment, the container then ends in `CrashLoopBackOff` once the
 restored workload exits. Delete the Pod to restore again.
 
+A restore that does not run ends like one that failed: the agent writes
+`restore-failed` into each destination's control directory and kills the
+container. That happens when the compatibility checks refuse the restore, when
+its preflight fails, and when its PodSnapshots are not ready to restore
+`config.restore.snapshotWaitSeconds` (default 60) after the first destination
+container started. A destination container that starts later finds
+`restore-failed` when it starts. The agent never restores into a container
+whose control directory holds `restore-failed`, whoever wrote it.
+
 The proxy reserves two exit codes:
 
 - 112 (`RestoreNotRepeatableExitCode`): the Pod's one restore is used up. The
@@ -207,7 +216,8 @@ PodSnapshot, in the Pod's namespace, restores into that destination container.
 
 The restore waits until every PodSnapshot is Ready and its snapshot is
 available, then restores all destinations in parallel. A PodSnapshot that
-failed, or that this node cannot run, ends the restore before any destination
+failed, that this node cannot run, or that is not ready within
+`config.restore.snapshotWaitSeconds`, ends the restore before any destination
 is restored. The `nvidia.com/Restored` condition reports the destinations
 together, with the same reasons as fan-out, and its messages name each
 destination's PodSnapshot. A Pod whose restore partially succeeded keeps the
@@ -308,6 +318,10 @@ Without the proxy:
   workload; the liveness probe is what notices.
 - Signals reach the inert command, not the workload. When the Pod is deleted,
   the workload gets no `SIGTERM`; it is killed at the end of the grace period.
-- After a failed restore, the agent kills the container. If it starts again, it
-  runs the inert command and is not restored. Delete the Pod to restore again.
+- After a failed or refused restore, the agent kills the container. If it
+  starts again, it runs the inert command and is not restored. Delete the Pod
+  to restore again. A command that starts the workload itself when no restore
+  comes can watch for `restore-failed`. When it gives up waiting on its own, it
+  should write `restore-failed` before it starts the workload, so that a
+  restore that becomes possible later stays out of the container.
 - The proxy's exit codes, 112 and 113, do not apply.

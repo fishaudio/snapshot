@@ -103,9 +103,12 @@ const (
 	RestoreCompleteFile = "restore-complete"
 
 	// RestoreFailedFile is written by the Snapshot agent before it kills a
-	// destination container whose restore failed. The failing container never
-	// acts on it; a later container in the same Pod reads it as proof that the
-	// Pod's one restore was already used.
+	// destination container whose restore failed, or whose restore it ended
+	// without running: refused, or its snapshot not ready in time. The
+	// failing container need not act on it; a later container in the same Pod
+	// reads it as proof that the Pod's one restore was already used. The agent
+	// never restores into a container whose control directory holds it,
+	// whoever wrote it.
 	RestoreFailedFile = "restore-failed"
 
 	// RestoreCompletePIDKey names the restored process's PID, relative to the
