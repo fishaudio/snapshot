@@ -212,6 +212,59 @@ func controlSentinelExists(procRoot string, hostPID int, name string) (bool, err
 	return true, nil
 }
 
+// maxControlFileBytes bounds what ReadControlFile reads: control files hold a
+// few key=value lines, and the workload, which can write anything there,
+// must not make the agent read a large file.
+const maxControlFileBytes = 4096
+
+// ReadControlFile reads a file in the workload container's snapshot-control
+// volume, up to maxControlFileBytes. It reports false, without error, when
+// nothing exists under the name. Like ControlSentinelExists it returns an
+// error when the control mount cannot be inspected, and only a regular file
+// counts: anything else under the name is an error. It never follows a
+// symlink and never blocks on a FIFO.
+func ReadControlFile(hostPID int, name string) ([]byte, bool, error) {
+	return readControlFile(HostProcPath, hostPID, name)
+}
+
+func readControlFile(procRoot string, hostPID int, name string) ([]byte, bool, error) {
+	if name == "" || name != filepath.Base(name) || name == ".." {
+		return nil, false, fmt.Errorf("invalid control file name %q", name)
+	}
+	dir, err := openContainerControlDir(procRoot, hostPID)
+	if err != nil {
+		return nil, false, fmt.Errorf("control file %q: %w", name, err)
+	}
+	defer dir.Close()
+	return readFileInDir(dir, name)
+}
+
+// readFileInDir reads name in dir, up to maxControlFileBytes, as
+// ReadControlFile does.
+func readFileInDir(dir *os.File, name string) ([]byte, bool, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, fmt.Errorf("open control file %s in %s: %w", name, dir.Name(), err)
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, true, fmt.Errorf("stat control file %s: %w", f.Name(), err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("control file %s is not a regular file", f.Name())
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxControlFileBytes))
+	if err != nil {
+		return nil, true, fmt.Errorf("read control file %s: %w", f.Name(), err)
+	}
+	return data, true, nil
+}
+
 // RemoveControlSentinel removes a sentinel from the snapshot-control mount at
 // dir. The directory must exist: a missing file is already removed, but a
 // missing mount is an error so callers do not confuse "cannot see the volume"

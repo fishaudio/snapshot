@@ -43,14 +43,15 @@ of its own, so a probe that never passes waits until you delete the
 a `SnapshotJob`'s `activeDeadlineSeconds` stops it. The `PodSnapshot` then
 fails at most five minutes after the Pod ended.
 
-## A restore fails with `Stopped waiting for the snapshot`
+## A restore ends with `RestoreSnapshotNotReady`
 
-The restore Pod's `PodSnapshot`s were not ready to restore
-`config.restore.snapshotWaitSeconds` after its first destination container
-started: a `PodSnapshot` did not exist, was not Ready, or its snapshot was not
-published yet. The message ends with what the restore was still waiting for.
-The agent ended the restore, and the destination containers started without
-it.
+The message starts with `Stopped waiting for the snapshot`. The restore Pod's
+`PodSnapshot`s were not ready to restore `config.restore.snapshotWaitSeconds`
+after its first destination container started: a `PodSnapshot` did not exist,
+was not Ready, or its snapshot was not published yet. The message ends with
+what the restore was still waiting for. The agent ended the restore, and the
+destination containers started without it. Nothing was restored, and nothing
+is wrong with the snapshot itself.
 
 ```bash
 kubectl get pod <restore-pod> -n <ns> -o jsonpath='{.status.conditions[?(@.type=="nvidia.com/Restored")].message}'
@@ -59,6 +60,17 @@ kubectl get podsnapshot -n <ns>
 
 Create restore Pods after their `PodSnapshot`s are Ready, or raise the wait.
 The Pod does not restore later; create a new one.
+
+## A restore ends with `RestoreEndedByWorkload`
+
+Every destination container already held a `restore-failed` that its own
+workload wrote: its command gave up waiting for the restore and started
+without one before the agent began. The agent leaves such a container alone.
+The message names each destination. A workload's wait shorter than the time
+the agent needs to begin, including `config.restore.snapshotWaitSeconds`,
+causes it; make the workload wait longer. When only some destinations ended
+this way, the condition is `RestorePartiallySucceeded` or `RestoreFailed`
+and lists them with the others.
 
 ## A checkpoint fails with `InvalidCheckpointReadinessProbe`
 

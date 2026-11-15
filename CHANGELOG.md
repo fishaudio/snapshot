@@ -112,6 +112,19 @@ commit-level history for each release is on its
   its restore; create a new Pod with the annotation. The agent never restores
   into a container whose control directory holds `restore-failed`. See
   [Restore Pod contract](docs/reference/restore-pod-contract.md).
+- Two restores that did not run now have their own reason on the
+  `nvidia.com/Restored` condition instead of `RestoreFailed`, so a controller
+  can tell them from a restore that failed: `RestoreSnapshotNotReady` when the
+  agent stopped waiting for the restore's `PodSnapshot`s
+  (`config.restore.snapshotWaitSeconds`), and `RestoreEndedByWorkload` when
+  every destination container's own workload had already written
+  `restore-failed` and started without a restore. The snapshot wait keeps its
+  message, and both reasons classify as `Failed`. The agent now writes `owner=agent` into
+  the `restore-failed` it writes itself, which is how it tells the two apart; a
+  destination it failed or ended before stays `RestoreFailed`. Anything that
+  matches on `RestoreFailed` to find a restore that did not run should also
+  match the new reasons. See
+  [Restore Pod contract](docs/reference/restore-pod-contract.md).
 - With `config.criu.tcpEstablished`, the default, a restore no longer waits
   for kubelet to publish the restore Pod's IP address, which can take up to a
   second after the Pod starts. While the API has none, the node agent reads it

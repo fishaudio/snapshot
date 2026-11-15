@@ -348,7 +348,7 @@ func Restore(ctx context.Context, rt snapshotruntime.Runtime, log logr.Logger, r
 		if usePageBrokerGPU {
 			// Abort may stop the placeholder before the controller can write its
 			// failure marker. Preserve the one-restore-per-pod contract first.
-			if markerErr := snapshotruntime.WriteControlSentinel(snap.PlaceholderPID, podcontract.RestoreFailedFile, []byte("restore failed\n")); markerErr != nil {
+			if markerErr := snapshotruntime.WriteControlSentinel(snap.PlaceholderPID, podcontract.RestoreFailedFile, podcontract.FormatAgentRestoreFailed()); markerErr != nil {
 				log.Error(markerErr, "Failed to write restore-failed sentinel")
 			}
 			terminateFailedRestore = func(stopCtx context.Context) error {

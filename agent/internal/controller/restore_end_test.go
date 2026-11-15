@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -27,6 +28,8 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/ai-dynamo/snapshot/agent/internal/executor"
+	snapshotruntime "github.com/ai-dynamo/snapshot/agent/internal/runtime"
 	"github.com/ai-dynamo/snapshot/api/compat"
 	"github.com/ai-dynamo/snapshot/api/podcontract"
 	snapshotv1alpha1 "github.com/ai-dynamo/snapshot/api/v1alpha1"
@@ -38,30 +41,30 @@ import (
 type controlVolume struct {
 	mu     sync.Mutex
 	pids   map[int]string
-	files  map[string][]string
+	files  map[string]map[string][]byte
 	killed []string
 }
 
 func newControlVolume(pids map[int]string) *controlVolume {
-	return &controlVolume{pids: pids, files: map[string][]string{}}
+	return &controlVolume{pids: pids, files: map[string]map[string][]byte{}}
 }
 
 // install points the controller's sentinel and signal operations at v.
 func (v *controlVolume) install(w *NodeController) {
-	w.writeControlSentinelFn = func(pid int, name string, _ []byte) error {
+	w.writeControlSentinelFn = func(pid int, name string, contents []byte) error {
 		v.mu.Lock()
 		defer v.mu.Unlock()
 		container, ok := v.pids[pid]
 		if !ok {
 			return fmt.Errorf("no process %d", pid)
 		}
-		v.files[container] = append(v.files[container], name)
+		v.put(container, name, contents)
 		return nil
 	}
-	w.writePodControlSentinelFn = func(_, container, name string, _ []byte) error {
+	w.writePodControlSentinelFn = func(_, container, name string, contents []byte) error {
 		v.mu.Lock()
 		defer v.mu.Unlock()
-		v.files[container] = append(v.files[container], name)
+		v.put(container, name, contents)
 		return nil
 	}
 	w.controlSentinelExistsFn = func(pid int, name string) (bool, error) {
@@ -71,7 +74,18 @@ func (v *controlVolume) install(w *NodeController) {
 		if !ok {
 			return false, fmt.Errorf("no process %d", pid)
 		}
-		return slices.Contains(v.files[container], name), nil
+		_, exists := v.files[container][name]
+		return exists, nil
+	}
+	w.readControlFileFn = func(pid int, name string) ([]byte, bool, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		container, ok := v.pids[pid]
+		if !ok {
+			return nil, false, fmt.Errorf("no process %d", pid)
+		}
+		contents, exists := v.files[container][name]
+		return slices.Clone(contents), exists, nil
 	}
 	w.sendSignalFn = func(_ logr.Logger, pid int, _ syscall.Signal, _ string) error {
 		v.mu.Lock()
@@ -88,16 +102,32 @@ func (v *controlVolume) start(pid int, container string) {
 	v.pids[pid] = container
 }
 
-func (v *controlVolume) write(container, name string) {
+// put stores a file; the caller holds v.mu.
+func (v *controlVolume) put(container, name string, contents []byte) {
+	if v.files[container] == nil {
+		v.files[container] = map[string][]byte{}
+	}
+	v.files[container][name] = slices.Clone(contents)
+}
+
+// write stores a file as the container's own workload would.
+func (v *controlVolume) write(container, name string, contents ...string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.files[container] = append(v.files[container], name)
+	v.put(container, name, []byte(strings.Join(contents, "")))
 }
 
 func (v *controlVolume) holds(container, name string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return slices.Contains(v.files[container], name)
+	_, exists := v.files[container][name]
+	return exists
+}
+
+func (v *controlVolume) read(container, name string) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return string(v.files[container][name])
 }
 
 func (v *controlVolume) kills() []string {
@@ -210,7 +240,7 @@ func TestSnapshotWaitEndsTheRestoreWhenTheSnapshotDoesNotAppear(t *testing.T) {
 	w.processRestoreQueueItem(context.Background(), item)
 
 	condition := appliedRestoredCondition(t, w)
-	assert.Equal(t, podcontract.RestoreReasonFailed, condition.Reason)
+	assert.Equal(t, podcontract.RestoreReasonSnapshotNotReady, condition.Reason)
 	assert.Equal(t, "Stopped waiting for the snapshot after 60s (config.restore.snapshotWaitSeconds): "+
 		"Waiting for PodSnapshot inference/snapshot-a; the destination containers start without a restore", condition.Message)
 	assert.Equal(t, []string{"main"}, volume.kills())
@@ -251,7 +281,7 @@ func TestSnapshotWaitCoversEveryWayTheSnapshotIsNotReady(t *testing.T) {
 
 			assert.False(t, requeue)
 			condition := appliedRestoredCondition(t, w)
-			assert.Equal(t, podcontract.RestoreReasonFailed, condition.Reason)
+			assert.Equal(t, podcontract.RestoreReasonSnapshotNotReady, condition.Reason)
 			assert.Contains(t, condition.Message, "Stopped waiting for the snapshot after 30s (config.restore.snapshotWaitSeconds): PodSnapshot snap-decode (decode): ")
 			assert.ElementsMatch(t, []string{"prefill", "decode"}, volume.kills(), "the wait counts from the first destination's start")
 		})
@@ -354,7 +384,7 @@ func TestARestoreIsNeverRunAfterTheAgentGaveUp(t *testing.T) {
 	t.Run("an agent that restarted since", func(t *testing.T) {
 		w, volume, pod := setup(t)
 		live := giveUp(t, w, volume, pod)
-		require.Equal(t, podcontract.RestoreReasonFailed, restoredPodCondition(live).Reason)
+		require.Equal(t, podcontract.RestoreReasonSnapshotNotReady, restoredPodCondition(live).Reason)
 		restarted := makeTestController(t, live)
 		restarted.config = w.config
 		restarted.client = w.client
@@ -495,4 +525,145 @@ func TestEndingSparesARestoredDestination(t *testing.T) {
 	assert.Contains(t, condition.Message, "PodSnapshot inference/snap-decode disappeared while restore was in progress")
 	assert.Equal(t, []string{"decode"}, volume.kills())
 	assert.False(t, volume.holds("prefill", podcontract.RestoreFailedFile))
+}
+
+// workloadGaveUp is what a destination container's own command writes into
+// restore-failed when it stops waiting and starts without a restore.
+const workloadGaveUp = "no restore within the workload's own wait; starting without one\n"
+
+// A destination whose workload gave up waiting, and wrote restore-failed,
+// before the agent came to restore it is left alone. That is not a failure of
+// the restore, so the outcome has its own reason.
+func TestARestoreIsNotRunIntoAContainerItsWorkloadEnded(t *testing.T) {
+	pod := restorePod(map[string]string{podcontract.RestoreFromAnnotation: "snapshot-a"})
+	snapshot, content := readySnapshotObjects()
+	w := makeTestController(t, pod, snapshot, content)
+	writeContentArtifact(t, w, content)
+	w.runtime = &containerPIDRuntime{fakeRuntime: &fakeRuntime{}, pids: map[string]int{testContainerID: 100}}
+	volume := newControlVolume(map[int]string{100: "main"})
+	volume.install(w)
+	volume.write("main", podcontract.RestoreFailedFile, workloadGaveUp)
+	w.restoreFn = noRestoreExpected(t)
+
+	processQueuedRestorePod(t, w, pod)
+
+	condition := appliedRestoredCondition(t, w)
+	assert.Equal(t, corev1.ConditionFalse, condition.Status)
+	assert.Equal(t, podcontract.RestoreReasonEndedByWorkload, condition.Reason)
+	assert.Equal(t, "Restore from PodSnapshot snapshot-a did not run: the workload of 1 destination container(s) "+
+		"started without a restore first: main: destination container already holds restore-failed from its workload: "+
+		"it gave up waiting and started without a restore, so it is not restored", condition.Message)
+	assert.Empty(t, volume.kills(), "the container runs its workload without a restore")
+	assert.Equal(t, workloadGaveUp, volume.read("main", podcontract.RestoreFailedFile), "the workload's marker stays as it wrote it")
+	assert.True(t, w.restoreHandled(pod))
+	assert.Equal(t, podcontract.RestoreOutcomeFailed, podcontract.ClassifyRestoreOutcome([]corev1.PodCondition{condition}),
+		"nothing was restored, and the outcome is terminal")
+}
+
+// In a Pod with several destinations, one whose workload started without a
+// restore is reported with its cause beside the others.
+func TestADestinationWhoseWorkloadEndedItIsReportedBesideTheOthers(t *testing.T) {
+	for name, tc := range map[string]struct {
+		decode      func(*controlVolume)
+		wantReason  string
+		wantMessage string
+	}{
+		"the other one restored": {
+			decode:     func(*controlVolume) {},
+			wantReason: podcontract.RestoreReasonPartiallySucceeded,
+			wantMessage: "Restored 1 of 2 destination containers from PodSnapshots snap-prefill (prefill), snap-decode (decode); " +
+				"not restored: prefill: destination container already holds restore-failed from its workload: " +
+				"it gave up waiting and started without a restore, so it is not restored",
+		},
+		"the other one's workload ended it too": {
+			decode:     func(v *controlVolume) { v.write("decode", podcontract.RestoreFailedFile, workloadGaveUp) },
+			wantReason: podcontract.RestoreReasonEndedByWorkload,
+			wantMessage: "Restore from PodSnapshots snap-prefill (prefill), snap-decode (decode) did not run: " +
+				"the workload of 2 destination container(s) started without a restore first: " +
+				"prefill: destination container already holds restore-failed from its workload: it gave up waiting and started without a restore, so it is not restored; " +
+				"decode: destination container already holds restore-failed from its workload: it gave up waiting and started without a restore, so it is not restored",
+		},
+		// The agent's own marker is a restore it failed or ended before: that
+		// stays a failure, and outweighs the workload's.
+		"the agent ended the other one before": {
+			decode: func(v *controlVolume) {
+				v.write("decode", podcontract.RestoreFailedFile, string(podcontract.FormatAgentRestoreFailed()))
+			},
+			wantReason: podcontract.RestoreReasonFailed,
+			wantMessage: "Restore failed for 1 destination container(s) from PodSnapshots snap-prefill (prefill), snap-decode (decode): " +
+				"decode: destination container already holds restore-failed from the agent: its restore failed or ended before, so it is not restored again; " +
+				"1 destination container(s) started without a restore first: " +
+				"prefill: destination container already holds restore-failed from its workload: it gave up waiting and started without a restore, so it is not restored",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pod := fanInRestorePod()
+			w := makeFanInController(t, pod, readyFanInSources())
+			w.runtime = &containerPIDRuntime{fakeRuntime: &fakeRuntime{}, pids: map[string]int{"prefill-id": 100, "decode-id": 200, "router-id": 300}}
+			volume := newControlVolume(map[int]string{100: "prefill", 200: "decode", 300: "router"})
+			volume.install(w)
+			volume.write("prefill", podcontract.RestoreFailedFile, workloadGaveUp)
+			tc.decode(volume)
+			var mu sync.Mutex
+			var restored []string
+			w.restoreFn = func(_ context.Context, _ snapshotruntime.Runtime, _ logr.Logger, req executor.RestoreRequest, _ executor.RestoreMounter) (executor.RestoreResult, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				restored = append(restored, req.DestinationContainerName)
+				return executor.RestoreResult{PlaceholderHostPID: 200, RestoredPID: 1}, nil
+			}
+
+			processQueuedRestorePod(t, w, pod)
+
+			condition := appliedRestoredCondition(t, w)
+			assert.Equal(t, tc.wantReason, condition.Reason)
+			assert.Equal(t, tc.wantMessage, condition.Message)
+			assert.NotContains(t, restored, "prefill")
+			assert.Empty(t, volume.kills())
+		})
+	}
+}
+
+// How a pass reads when some destinations' workloads started without a
+// restore, beside the other outcomes.
+func TestRestoreVerdictWithDestinationsWhoseWorkloadEndedTheRestore(t *testing.T) {
+	ended := func(destination string) restoreResult {
+		return restoreResult{destination: destination, state: restoreResultDeclined,
+			reason: "it started without a restore", declinedReason: podcontract.RestoreReasonEndedByWorkload}
+	}
+	for name, tc := range map[string]struct {
+		results     []restoreResult
+		wantReason  string
+		wantMessage string
+	}{
+		"still in progress": {
+			results:     []restoreResult{ended("prefill"), {destination: "decode", state: restoreResultPending}},
+			wantReason:  podcontract.RestoreReasonInProgress,
+			wantMessage: "Restore from PodSnapshot snap remains in progress: 0 succeeded, 0 failed, 1 started without a restore, 1 pending (decode)",
+		},
+		"beside a refusal": {
+			results: []restoreResult{ended("prefill"), {destination: "decode", state: restoreResultIncompatible,
+				reason: "gpu-count: source 1, target 0"}},
+			wantReason: podcontract.RestoreReasonIncompatible,
+			wantMessage: "Refused restore; this node cannot run the checkpoint: decode: gpu-count: source 1, target 0; " +
+				"1 destination container(s) started without a restore first: prefill: it started without a restore",
+		},
+		"beside a failure and a refusal": {
+			results: []restoreResult{
+				ended("prefill"),
+				{destination: "decode", state: restoreResultFailed, reason: "CRIU restore failed: boom"},
+				{destination: "aux", state: restoreResultIncompatible, reason: "gpu-count: source 1, target 0"},
+			},
+			wantReason: podcontract.RestoreReasonFailed,
+			wantMessage: "Restore failed for 1 destination container(s) and refused 1 incompatible destination(s) from PodSnapshot snap: " +
+				"decode: CRIU restore failed: boom; 1 destination container(s) started without a restore first: prefill: it started without a restore",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			verdict := tallyRestoreResults(tc.results).verdict("snap")
+
+			assert.Equal(t, tc.wantReason, verdict.reason)
+			assert.Equal(t, tc.wantMessage, verdict.message)
+		})
+	}
 }

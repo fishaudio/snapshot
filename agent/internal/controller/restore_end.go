@@ -209,10 +209,27 @@ func (w *NodeController) markRestoreFailedOnNode(ctx context.Context, pod *corev
 	}
 }
 
+// restoreDeclinedError reports a destination the agent did not restore
+// because its workload had already decided to start without a restore. It is
+// not a failure of the restore: reason is the outcome's own condition reason.
+type restoreDeclinedError struct {
+	reason  string
+	message string
+}
+
+func (e *restoreDeclinedError) Error() string {
+	return e.message
+}
+
 // refuseEndedDestination keeps a restore out of a destination container that
 // holds restore-failed: a failed or ended restore of this Pod, or its own
 // workload, told it that no restore is coming, and it may be running its
 // workload without one by now. The container is neither restored nor killed.
+//
+// Who wrote restore-failed decides the outcome. The agent's own marker means
+// an earlier pass or agent failed or ended this restore, which stays a
+// failure. Any other came from the workload, which gave up waiting and
+// started without a restore: a restoreDeclinedError.
 func (op *restoreOperation) refuseEndedDestination(ctx context.Context) error {
 	hostPID, _, err := op.controller.runtime.ResolveContainer(ctx, op.containerID)
 	if err != nil {
@@ -220,14 +237,20 @@ func (op *restoreOperation) refuseEndedDestination(ctx context.Context) error {
 		// either, and reports that itself.
 		return nil
 	}
-	ended, err := op.controller.controlSentinelExistsFn(hostPID, podcontract.RestoreFailedFile)
+	contents, ended, err := op.controller.readControlFileFn(hostPID, podcontract.RestoreFailedFile)
 	if err != nil {
 		return fmt.Errorf("check for a restore-failed sentinel before restoring: %w", err)
 	}
-	if ended {
-		return errors.New("destination container already holds restore-failed: its restore ended before, and it may run without one, so it is not restored")
+	if !ended {
+		return nil
 	}
-	return nil
+	if podcontract.RestoreFailedByAgent(contents) {
+		return errors.New("destination container already holds restore-failed from the agent: its restore failed or ended before, so it is not restored again")
+	}
+	return &restoreDeclinedError{
+		reason:  podcontract.RestoreReasonEndedByWorkload,
+		message: "destination container already holds restore-failed from its workload: it gave up waiting and started without a restore, so it is not restored",
+	}
 }
 
 // endableDestinations names the containers of the Pod that a restore the
@@ -285,7 +308,7 @@ func (w *NodeController) endRestoreAfterSnapshotWait(ctx context.Context, pod *c
 	)
 	message := fmt.Sprintf("Stopped waiting for the snapshot after %ds (config.restore.snapshotWaitSeconds): %s; the destination containers start without a restore",
 		int64(wait/time.Second), pending.message)
-	return true, w.endRestore(ctx, pod, destinations, podcontract.RestoreReasonFailed, message)
+	return true, w.endRestore(ctx, pod, destinations, podcontract.RestoreReasonSnapshotNotReady, message)
 }
 
 // snapshotWaitStart is when a restore Pod started waiting for its snapshot:

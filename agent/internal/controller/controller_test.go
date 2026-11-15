@@ -156,7 +156,7 @@ func TestNewDefaultControllerSetsDefaultOperations(t *testing.T) {
 		testr.New(t),
 	)
 	t.Cleanup(w.restoreQueue.ShutDown)
-	if w.checkpointFn == nil || w.restoreFn == nil || w.writeControlSentinelFn == nil || w.writePodControlSentinelFn == nil || w.controlSentinelExistsFn == nil || w.sendSignalFn == nil || w.restoreQueue == nil {
+	if w.checkpointFn == nil || w.restoreFn == nil || w.writeControlSentinelFn == nil || w.writePodControlSentinelFn == nil || w.controlSentinelExistsFn == nil || w.readControlFileFn == nil || w.sendSignalFn == nil || w.restoreQueue == nil {
 		t.Fatal("default controller operations must be initialized")
 	}
 	if w.compareFn == nil {
@@ -199,6 +199,7 @@ func makeTestController(t *testing.T, pod *corev1.Pod, apiObjects ...runtime.Obj
 		writeControlSentinelFn:    func(int, string, []byte) error { return nil },
 		writePodControlSentinelFn: func(string, string, string, []byte) error { return nil },
 		controlSentinelExistsFn:   func(int, string) (bool, error) { return false, nil },
+		readControlFileFn:         func(int, string) ([]byte, bool, error) { return nil, false, nil },
 		sendSignalFn:              func(logr.Logger, int, syscall.Signal, string) error { return nil },
 		restoreQueue:              workqueue.NewTypedDelayingQueue[client.ObjectKey](),
 		compareFn:                 compat.Compare,

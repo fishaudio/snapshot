@@ -73,6 +73,7 @@ type NodeController struct {
 	writeControlSentinelFn    func(int, string, []byte) error
 	writePodControlSentinelFn func(string, string, string, []byte) error
 	controlSentinelExistsFn   func(int, string) (bool, error)
+	readControlFileFn         func(int, string) ([]byte, bool, error)
 	sendSignalFn              func(logr.Logger, int, syscall.Signal, string) error
 	// hostProcPath is where the agent reads the node's processes; tests point it elsewhere.
 	hostProcPath         string
@@ -170,6 +171,9 @@ const (
 	restoreResultSucceeded
 	restoreResultFailed
 	restoreResultIncompatible
+	// restoreResultDeclined: the destination's workload had already decided
+	// to start without a restore, so the agent left it alone.
+	restoreResultDeclined
 )
 
 type restoreResult struct {
@@ -178,8 +182,10 @@ type restoreResult struct {
 	// empty for a restore-from Pod, which has one PodSnapshot.
 	snapshot string
 	state    restoreResultState
-	// reason explains a failed or incompatible outcome.
+	// reason explains a failed, incompatible or declined outcome.
 	reason string
+	// declinedReason is the condition reason of a declined outcome.
+	declinedReason string
 }
 
 type restorePendingError struct {
@@ -236,9 +242,10 @@ const (
 // podSnapshotContentGVR is the cluster-scoped resource the capture informer watches.
 var podSnapshotContentGVR = snapshotv1alpha1.GroupVersion.WithResource("podsnapshotcontents")
 
-// restoreFailedSentinelContents is informational: readers of restore-failed
-// act on its existence only.
-var restoreFailedSentinelContents = []byte("failed\n")
+// restoreFailedSentinelContents names the agent as the writer of
+// restore-failed. Readers act on the file's existence; the agent itself reads
+// the owner to tell a restore it ended from one the workload gave up on.
+var restoreFailedSentinelContents = podcontract.FormatAgentRestoreFailed()
 
 // NewNodeController creates the node-local controller that runs inside snapshot-agent.
 func NewNodeController(
@@ -304,6 +311,7 @@ func newDefaultController(
 		writeControlSentinelFn:    snapshotruntime.WriteControlSentinel,
 		writePodControlSentinelFn: snapshotruntime.WritePodControlSentinel,
 		controlSentinelExistsFn:   snapshotruntime.ControlSentinelExists,
+		readControlFileFn:         snapshotruntime.ReadControlFile,
 		sendSignalFn:              snapshotruntime.SendSignalToPID,
 		hostProcPath:              snapshotruntime.HostProcPath,
 		stagingCapacityFn:         snapshotruntime.StagingCapacity,
@@ -930,6 +938,12 @@ type restoreTally struct {
 	incompatibilityReasons []string
 	// failureReasons holds "<destination>: <cause>" for each failed destination.
 	failureReasons []string
+	// declined holds the destinations whose workload started without a
+	// restore, declineReasons "<destination>: <cause>" for each, and
+	// declinedReasons the condition reason of each.
+	declined        []string
+	declineReasons  []string
+	declinedReasons []string
 	// snapshotMappings names the PodSnapshot of each destination of a
 	// restore-from-map Pod. It is empty for a restore-from Pod.
 	snapshotMappings []podcontract.SnapshotMapping
@@ -981,6 +995,10 @@ func tallyRestoreResults(results []restoreResult) restoreTally {
 			tally.failureReasons = append(tally.failureReasons, reason)
 		case restoreResultPending:
 			tally.pending = append(tally.pending, result.destination)
+		case restoreResultDeclined:
+			tally.declined = append(tally.declined, result.destination)
+			tally.declineReasons = append(tally.declineReasons, fmt.Sprintf("%s: %s", result.destination, result.reason))
+			tally.declinedReasons = append(tally.declinedReasons, result.declinedReason)
 		case restoreResultIncompatible:
 			tally.incompatible = append(tally.incompatible, result.destination)
 			reason := result.reason
@@ -1018,7 +1036,7 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 			reason:  podcontract.RestoreReasonInProgress,
 			message: t.progressMessage(snapshotName),
 		}
-	case len(t.failed) == 0 && len(t.incompatible) == 0:
+	case len(t.failed) == 0 && len(t.incompatible) == 0 && len(t.declined) == 0:
 		return restoreVerdict{
 			status: corev1.ConditionTrue,
 			reason: podcontract.RestoreReasonSucceeded,
@@ -1027,25 +1045,41 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 		}
 	case len(t.succeeded) != 0:
 		// Causes can contain commas, so entries are separated by semicolons.
-		notRestored := append(append([]string{}, t.failureReasons...), t.incompatible...)
+		notRestored := append(append(append([]string{}, t.failureReasons...), t.incompatible...), t.declineReasons...)
 		return restoreVerdict{
 			status: corev1.ConditionFalse,
 			reason: podcontract.RestoreReasonPartiallySucceeded,
 			message: fmt.Sprintf("Restored %d of %d destination containers from %s; not restored: %s",
 				len(t.succeeded), t.total, from, strings.Join(notRestored, "; ")),
 		}
+	case len(t.failed) == 0 && len(t.incompatible) == 0:
+		// Every workload started without the restore first. That says nothing
+		// about the snapshot, so it is not a failure of the restore.
+		return restoreVerdict{
+			status: corev1.ConditionFalse,
+			reason: t.declinedReason(),
+			message: fmt.Sprintf("Restore from %s did not run: the workload of %d destination container(s) started without a restore first: %s",
+				from, len(t.declined), strings.Join(t.declineReasons, "; ")),
+		}
 	case len(t.failed) == 0:
 		return restoreVerdict{
 			status:  corev1.ConditionFalse,
 			reason:  podcontract.RestoreReasonIncompatible,
-			message: refusalMessage(strings.Join(t.incompatibilityReasons, "; ")),
+			message: refusalMessage(strings.Join(t.incompatibilityReasons, "; ")) + t.alsoDeclined(),
 		}
 	case len(t.incompatible) != 0:
 		return restoreVerdict{
 			status: corev1.ConditionFalse,
 			reason: podcontract.RestoreReasonFailed,
 			message: fmt.Sprintf("Restore failed for %d destination container(s) and refused %d incompatible destination(s) from %s: %s",
-				len(t.failed), len(t.incompatible), from, strings.Join(t.failureReasons, "; ")),
+				len(t.failed), len(t.incompatible), from, strings.Join(t.failureReasons, "; ")) + t.alsoDeclined(),
+		}
+	case len(t.declined) != 0:
+		return restoreVerdict{
+			status: corev1.ConditionFalse,
+			reason: podcontract.RestoreReasonFailed,
+			message: fmt.Sprintf("Restore failed for %d destination container(s) from %s: %s",
+				len(t.failed), from, strings.Join(t.failureReasons, "; ")) + t.alsoDeclined(),
 		}
 	default:
 		return restoreVerdict{
@@ -1057,6 +1091,30 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 	}
 }
 
+// declinedReason is the condition reason of a pass in which every
+// destination's workload started without a restore: their own reason when
+// they all agree, else RestoreReasonEndedByWorkload, which covers them all.
+func (t restoreTally) declinedReason() string {
+	reason := podcontract.RestoreReasonEndedByWorkload
+	for i, declined := range t.declinedReasons {
+		if i != 0 && declined != reason {
+			return podcontract.RestoreReasonEndedByWorkload
+		}
+		reason = declined
+	}
+	return reason
+}
+
+// alsoDeclined names, after a failure or refusal, the destinations whose
+// workload started without a restore. It is empty when there are none.
+func (t restoreTally) alsoDeclined() string {
+	if len(t.declined) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; %d destination container(s) started without a restore first: %s",
+		len(t.declined), strings.Join(t.declineReasons, "; "))
+}
+
 func (t restoreTally) progressMessage(snapshotName string) string {
 	counts := []string{
 		fmt.Sprintf("%d succeeded", len(t.succeeded)),
@@ -1064,6 +1122,9 @@ func (t restoreTally) progressMessage(snapshotName string) string {
 	}
 	if len(t.incompatible) != 0 {
 		counts = append(counts, fmt.Sprintf("%d incompatible", len(t.incompatible)))
+	}
+	if len(t.declined) != 0 {
+		counts = append(counts, fmt.Sprintf("%d started without a restore", len(t.declined)))
 	}
 	counts = append(counts, fmt.Sprintf("%d pending", len(t.pending)))
 
@@ -1118,6 +1179,15 @@ func (w *NodeController) restoreDestination(
 			result.state = restoreResultIncompatible
 			result.reason = compat.Reasons(incompatible.Mismatches)
 			w.logRestoreRefusal(pod, incompatible, result.reason)
+			return result
+		}
+		var declined *restoreDeclinedError
+		if errors.As(err, &declined) {
+			result.state = restoreResultDeclined
+			result.reason = declined.message
+			result.declinedReason = declined.reason
+			log.Info("Not restoring a destination container whose workload started without a restore",
+				"reason", declined.reason, "message", declined.message)
 			return result
 		}
 		result.state = restoreResultFailed

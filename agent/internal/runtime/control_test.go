@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // fakeContainer lays out procRoot/<pid>/root/snapshot-control, as the agent
@@ -181,6 +183,68 @@ func TestControlSentinelExistsWithoutControlDir(t *testing.T) {
 	}
 	if _, err := controlSentinelExists(procRoot, pid, "restore-complete"); err == nil {
 		t.Fatal("expected an error for a missing control mount")
+	}
+}
+
+func TestReadControlFile(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	path := filepath.Join(controlDir, "restore-failed")
+
+	data, exists, err := readControlFile(procRoot, pid, "restore-failed")
+	if err != nil || exists || data != nil {
+		t.Fatalf("nothing there: got %q, %v, %v", data, exists, err)
+	}
+
+	if err := os.WriteFile(path, []byte("owner=agent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, exists, err = readControlFile(procRoot, pid, "restore-failed")
+	if err != nil || !exists || string(data) != "owner=agent\n" {
+		t.Fatalf("regular file: got %q, %v, %v", data, exists, err)
+	}
+
+	// The workload can write anything there; the agent reads a bounded prefix.
+	if err := os.WriteFile(path, make([]byte, 3*maxControlFileBytes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, exists, err = readControlFile(procRoot, pid, "restore-failed")
+	if err != nil || !exists || len(data) != maxControlFileBytes {
+		t.Fatalf("large file: got %d bytes, %v, %v", len(data), exists, err)
+	}
+}
+
+func TestReadControlFileRefusesWhatIsNotARegularFile(t *testing.T) {
+	for name, plant := range map[string]func(path string) error{
+		"symlink": func(path string) error {
+			return os.Symlink(filepath.Join(os.TempDir(), "anything"), path)
+		},
+		"directory": func(path string) error { return os.Mkdir(path, 0o755) },
+		// O_NONBLOCK keeps the open from waiting for a writer.
+		"fifo": func(path string) error { return unix.Mkfifo(path, 0o644) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			procRoot, pid, controlDir := fakeContainer(t)
+			if err := plant(filepath.Join(controlDir, "restore-claim")); err != nil {
+				t.Fatal(err)
+			}
+			data, exists, err := readControlFile(procRoot, pid, "restore-claim")
+			if err == nil || !exists || data != nil {
+				t.Fatalf("got %q, %v, %v; want an error for something that exists", data, exists, err)
+			}
+		})
+	}
+}
+
+func TestReadControlFileWithoutControlDir(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	if err := os.Remove(controlDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readControlFile(procRoot, pid, "restore-failed"); err == nil {
+		t.Fatal("expected an error for a missing control mount")
+	}
+	if _, _, err := readControlFile(procRoot, pid, "../restore-failed"); err == nil {
+		t.Fatal("expected an error for a name outside the control directory")
 	}
 }
 

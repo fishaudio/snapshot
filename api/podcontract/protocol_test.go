@@ -186,6 +186,37 @@ func TestParseRestoreComplete(t *testing.T) {
 	}
 }
 
+func TestRestoreFailedByAgent(t *testing.T) {
+	if !RestoreFailedByAgent(FormatAgentRestoreFailed()) {
+		t.Fatalf("RestoreFailedByAgent(%q) = false, want true", FormatAgentRestoreFailed())
+	}
+	for name, data := range map[string]string{
+		"agent among other lines": "a workload's note\nowner=agent\n",
+		"padded":                  "  owner=agent  \n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !RestoreFailedByAgent([]byte(data)) {
+				t.Fatalf("RestoreFailedByAgent(%q) = false, want true", data)
+			}
+		})
+	}
+	// Workloads write restore-failed in any form; none of these is the agent's.
+	for name, data := range map[string]string{
+		"empty":                    "",
+		"earlier agent":            "failed\n",
+		"free text":                "cold start without a restore (no restore within --restore-timeout)\n",
+		"workload owner":           "owner=workload\n",
+		"agent named in free text": "owner: agent\n",
+		"first owner line decides": "owner=workload\nowner=agent\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if RestoreFailedByAgent([]byte(data)) {
+				t.Fatalf("RestoreFailedByAgent(%q) = true, want false", data)
+			}
+		})
+	}
+}
+
 func TestIsReservedControlFile(t *testing.T) {
 	for _, name := range []string{RestoreCompleteFile, RestoreFailedFile, RestoreProxyBinaryName, CUDAJobFileName} {
 		if !IsReservedControlFile(name) {

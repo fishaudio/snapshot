@@ -186,6 +186,16 @@ container started. A destination container that starts later finds
 `restore-failed` when it starts. The agent never restores into a container
 whose control directory holds `restore-failed`, whoever wrote it.
 
+The `nvidia.com/Restored` condition tells these apart. A refusal is
+`RestoreIncompatible`, and a restore whose PodSnapshots were not ready in time
+is `RestoreSnapshotNotReady`. When every destination's own workload had
+written `restore-failed` before the agent began, the restore is
+`RestoreEndedByWorkload`. The agent writes `owner=agent` into the
+`restore-failed` it writes, which is how it tells its own marker from the
+workload's; a workload that writes the file should write anything else. All
+three classify as `Failed` in `podcontract.ClassifyRestoreOutcome`: nothing
+was restored.
+
 The proxy reserves two exit codes:
 
 - 112 (`RestoreNotRepeatableExitCode`): the Pod's one restore is used up. The

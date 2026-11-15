@@ -108,8 +108,18 @@ const (
 	// failing container need not act on it; a later container in the same Pod
 	// reads it as proof that the Pod's one restore was already used. The agent
 	// never restores into a container whose control directory holds it,
-	// whoever wrote it.
+	// whoever wrote it. What the agent writes into it is
+	// FormatAgentRestoreFailed; anything else came from the workload, which
+	// may write it before it starts without a restore.
 	RestoreFailedFile = "restore-failed"
+
+	// ControlFileOwnerKey names who wrote a control file, in its key=value
+	// lines.
+	ControlFileOwnerKey = "owner"
+
+	// ControlFileOwnerAgent is the owner of a control file the Snapshot agent
+	// wrote.
+	ControlFileOwnerAgent = "agent"
 
 	// RestoreCompletePIDKey names the restored process's PID, relative to the
 	// destination container's PID namespace, in RestoreCompleteFile.
@@ -191,6 +201,26 @@ func ParseRestoreComplete(data []byte) (RestoreComplete, error) {
 		return RestoreComplete{}, fmt.Errorf("%s has no %s", RestoreCompleteFile, RestoreCompletePIDKey)
 	}
 	return rc, nil
+}
+
+// FormatAgentRestoreFailed renders what the agent writes into
+// RestoreFailedFile: it names the agent as its owner, so the agent can tell a
+// restore it ended itself from one the workload gave up on.
+func FormatAgentRestoreFailed() []byte {
+	return []byte(ControlFileOwnerKey + "=" + ControlFileOwnerAgent + "\n")
+}
+
+// RestoreFailedByAgent reports whether the content of RestoreFailedFile names
+// the agent as its owner. Workloads write it in any form, so lines that are
+// not key=value are skipped rather than rejected.
+func RestoreFailedByAgent(data []byte) bool {
+	for line := range strings.Lines(string(data)) {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && key == ControlFileOwnerKey {
+			return value == ControlFileOwnerAgent
+		}
+	}
+	return false
 }
 
 // ContainerMapping maps the one captured source container to a restore

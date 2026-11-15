@@ -75,6 +75,16 @@ func TestClassifyRestoreOutcome(t *testing.T) {
 			conditions: []corev1.PodCondition{restored(corev1.ConditionFalse, RestoreReasonPartiallySucceeded)},
 			want:       RestoreOutcomePartiallySucceeded,
 		},
+		{
+			name:       "snapshot not ready",
+			conditions: []corev1.PodCondition{restored(corev1.ConditionFalse, RestoreReasonSnapshotNotReady)},
+			want:       RestoreOutcomeFailed,
+		},
+		{
+			name:       "ended by workload",
+			conditions: []corev1.PodCondition{restored(corev1.ConditionFalse, RestoreReasonEndedByWorkload)},
+			want:       RestoreOutcomeFailed,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

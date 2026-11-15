@@ -51,6 +51,15 @@ const (
 	RestoreReasonPartiallySucceeded = "RestorePartiallySucceeded"
 	// RestoreReasonIncompatible marks a restore refused before CRIU.
 	RestoreReasonIncompatible = "RestoreIncompatible"
+	// RestoreReasonSnapshotNotReady marks a restore the agent ended, with no
+	// destination restored, because its PodSnapshots were not ready to restore
+	// within config.restore.snapshotWaitSeconds. Nothing was restored, and
+	// nothing about the snapshots failed.
+	RestoreReasonSnapshotNotReady = "RestoreSnapshotNotReady"
+	// RestoreReasonEndedByWorkload marks a restore that did not run because
+	// the workload of every destination container had already given up on it
+	// and started without one: each held a restore-failed its workload wrote.
+	RestoreReasonEndedByWorkload = "RestoreEndedByWorkload"
 )
 
 // ClassifyRestoreOutcome returns the public restore outcome represented by Pod
@@ -68,7 +77,8 @@ func ClassifyRestoreOutcome(conditions []corev1.PodCondition) RestoreOutcome {
 			return RestoreOutcomeUnknown
 		}
 		switch condition.Reason {
-		case RestoreReasonFailed, RestoreReasonIncompatible:
+		case RestoreReasonFailed, RestoreReasonIncompatible,
+			RestoreReasonSnapshotNotReady, RestoreReasonEndedByWorkload:
 			return RestoreOutcomeFailed
 		case RestoreReasonPartiallySucceeded:
 			return RestoreOutcomePartiallySucceeded
