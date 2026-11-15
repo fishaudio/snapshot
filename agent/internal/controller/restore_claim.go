@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 
@@ -42,10 +43,11 @@ type destinationClaim struct {
 	unreadable error
 }
 
-// heldByWorkload reports whether the claim is the workload's: a readable claim
-// that does not name the agent.
+// heldByWorkload reports whether the claim is the workload's: one that reads
+// owner=workload. Any other claim that is not ours, an unreadable one
+// included, is treated like a claim the agent made for an earlier container.
 func (c destinationClaim) heldByWorkload() bool {
-	return !c.ours && c.unreadable == nil && c.holder.Owner != podcontract.ControlFileOwnerAgent
+	return !c.ours && c.unreadable == nil && c.holder.Owner == podcontract.ControlFileOwnerWorkload
 }
 
 // describe says who holds a claim that is not ours.
@@ -75,16 +77,16 @@ func (w *NodeController) claimDestination(hostPID int, containerID string) (dest
 	created, err := w.claimControlFileFn(hostPID, podcontract.RestoreClaimFile, contents)
 	if created {
 		if err != nil {
-			// Ours all the same. Only an agent that comes back to it after a
-			// restart cannot tell that it is, and leaves the container alone.
-			w.log.Error(err, "Claimed a destination container but could not record the claim", "container_id", containerID)
+			// Ours, and whole: only the temporary file it was written
+			// through is left behind.
+			w.log.Error(err, "Claimed a destination container but could not clean up after it", "container_id", containerID)
 		}
 		return destinationClaim{ours: true}, nil
 	}
 	if err != nil {
 		return destinationClaim{}, fmt.Errorf("claim the destination container: %w", err)
 	}
-	data, exists, err := w.readControlFileFn(hostPID, podcontract.RestoreClaimFile)
+	holder, exists, err := w.readClaim(hostPID)
 	switch {
 	case err != nil:
 		return destinationClaim{unreadable: err}, nil
@@ -92,11 +94,38 @@ func (w *NodeController) claimDestination(hostPID int, containerID string) (dest
 		// Nobody removes a claim, so one that went away was not the agent's.
 		return destinationClaim{unreadable: errors.New("it was removed")}, nil
 	}
-	holder, err := podcontract.ParseRestoreClaim(data)
-	if err != nil {
-		return destinationClaim{unreadable: err}, nil
-	}
 	return destinationClaim{ours: holder.HeldByAgentFor(containerID), holder: holder}, nil
+}
+
+// A claim is created whole, but one made by a writer that creates the file
+// before it writes it can be read empty or cut short for a moment. The agent
+// reads such a claim again, up to claimReadAttempts times claimReadInterval
+// apart, before it takes it as unreadable.
+const (
+	claimReadAttempts = 5
+	claimReadInterval = 20 * time.Millisecond
+)
+
+// readClaim reads the claim in a destination container's control directory,
+// through hostPID, a process in it. exists is false when there is none. A
+// claim that does not parse is read again, as above, before it is reported.
+func (w *NodeController) readClaim(hostPID int) (claim podcontract.RestoreClaim, exists bool, err error) {
+	for attempt := range claimReadAttempts {
+		if attempt != 0 {
+			time.Sleep(claimReadInterval)
+		}
+		data, found, readErr := w.readControlFileFn(hostPID, podcontract.RestoreClaimFile)
+		if readErr != nil || !found {
+			// Not a regular file, or no claim at all: reading again does
+			// not change that.
+			return podcontract.RestoreClaim{}, found, readErr
+		}
+		claim, err = podcontract.ParseRestoreClaim(data)
+		if err == nil {
+			return claim, true, nil
+		}
+	}
+	return podcontract.RestoreClaim{}, true, err
 }
 
 // claimDestination claims the destination container before the restore touches

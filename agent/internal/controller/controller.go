@@ -1369,6 +1369,20 @@ func (op *restoreOperation) recoverCompletedRestore(ctx context.Context) (bool, 
 	if !exists {
 		return false, nil
 	}
+	// restore-complete outlives the container it was written into. Only the
+	// agent's own claim on this container says the restore that wrote it ran
+	// here: a later container of the Pod started without a restore, and must
+	// not be reported restored. A restore-complete without any claim was
+	// written by an agent from before claims, and counts as before.
+	claim, claimed, err := op.controller.readClaim(hostPID)
+	if !claimed && err == nil {
+		return true, nil
+	}
+	if err != nil || !claim.HeldByAgentFor(snapshotruntime.StripCRIScheme(op.containerID)) {
+		op.log.Info("restore-complete is from a restore into an earlier container of the Pod; not resuming it",
+			"claim_container_id", claim.ContainerID, "claim_error", fmt.Sprint(err))
+		return false, nil
+	}
 	return true, nil
 }
 

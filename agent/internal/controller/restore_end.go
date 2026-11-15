@@ -265,6 +265,18 @@ func (op *restoreOperation) refuseEndedDestination(ctx context.Context) error {
 	if podcontract.RestoreFailedByAgent(contents) {
 		return errors.New("destination container already holds restore-failed from the agent: its restore failed or ended before, so it is not restored again")
 	}
+	// A workload that waited for a restore the agent had claimed writes
+	// restore-failed too when it stops waiting. With the claim not the
+	// workload's, that is a restore that did not finish, not a workload that
+	// gave up before the agent began.
+	claim, claimed, err := op.controller.readClaim(hostPID)
+	switch {
+	case claimed && err != nil:
+		return fmt.Errorf("destination container already holds restore-failed and a restore claim that cannot be read (%v), so it is not restored again", err)
+	case claimed && claim.Owner != podcontract.ControlFileOwnerWorkload:
+		return fmt.Errorf("destination container already holds restore-failed, and the agent had claimed it for container %s: "+
+			"the restore it claimed did not finish, so it is not restored again", claim.ContainerID)
+	}
 	return &restoreDeclinedError{
 		reason:  podcontract.RestoreReasonEndedByWorkload,
 		message: "destination container already holds restore-failed from its workload: it gave up waiting and started without a restore, so it is not restored",

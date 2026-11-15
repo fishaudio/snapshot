@@ -127,7 +127,8 @@ commit-level history for each release is on its
   [Restore Pod contract](docs/reference/restore-pod-contract.md).
 - The agent claims each destination container before it restores into it
   or ends it, by creating `restore-claim` in the container's control directory
-  with an exclusive create. A command that starts the workload itself when no
+  whole: a temporary file hard-linked to that name, which fails if it exists.
+  A command that starts the workload itself when no
   restore comes, on a node without the restore proxy, can claim the container
   the same way before it starts: if it claims first, the agent neither
   restores into the container nor kills it, and the restore ends with the new

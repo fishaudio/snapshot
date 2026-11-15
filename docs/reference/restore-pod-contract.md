@@ -348,9 +348,12 @@ share the container's GPUs. `restore-claim` in the destination's control
 directory settles the race. Whoever creates it first owns the container until
 the Pod is deleted:
 
-- Create it with an exclusive create (`O_CREAT|O_EXCL`, for example
-  `open(path, O_WRONLY|O_CREAT|O_EXCL, 0644)`), then write `owner=workload`
-  into it. Nothing else decides the claim: only whether your create succeeded.
+- Create it whole: write `owner=workload` into a temporary file in the same
+  directory, then hard-link that file to `restore-claim` (`link(2)` or
+  `linkat(2)`) and remove the temporary file. The link fails with `EEXIST` if
+  anything exists under the name, so it decides the claim as an exclusive
+  create would, and the claim is never seen empty. Nothing else decides the
+  claim: only whether your link succeeded.
 - Nobody removes, renames or rewrites it. It outlives the container's
   restarts, since the control directory is the Pod's `emptyDir`. The agent
   clears `restore-complete` and `restore-failed` before each restore, never
@@ -361,21 +364,33 @@ the Pod is deleted:
   `owner=agent` and the container's runtime ID (`container=<id>`). It restores
   only into a container whose claim it created, or created before for the
   same container, after an agent restart.
-- If your create fails because the file exists, and it does not say
+- The content is `key=value` lines; spaces around keys and values are
+  ignored, and so are unknown keys. `owner` is exactly `agent` or `workload`.
+- If your link fails because the file exists, and it does not say
   `owner=workload`, the agent owns the container: do not start the workload.
   Keep waiting for `restore-complete` or `restore-failed`, with a limit of your
   own; past it, write `restore-failed` and exit, so the container's restart
-  starts the workload. Treat an empty or unreadable claim the same way: the
-  agent writes its claim's content just after creating it. A claim that says
-  `owner=workload` is yours, from an earlier container of the Pod.
+  starts the workload. Treat an empty or unreadable claim the same way. A
+  claim that says `owner=workload` is yours, from an earlier container of the
+  Pod.
 - If the workload claimed the container first, the agent neither restores
   into it nor kills it, and writes nothing into it. The restore ends with reason
   `RestoreClaimedByWorkload` when every destination was claimed that way.
 - A claim the agent made for an earlier container of the Pod, or one it cannot
-  read, keeps the restore out of the container too. The agent then writes
-  `restore-failed`, unless the container holds one, so that what waits there
-  stops waiting, but does not kill the container; the restore is
-  `RestoreFailed`.
+  read (empty, or an `owner` other than `agent` or `workload`, after reading
+  it again for up to 100 ms), keeps the restore out of the container too. The
+  agent then writes `restore-failed`, unless the container holds one, so that
+  what waits there stops waiting, but does not kill the container; the restore
+  is `RestoreFailed`.
+- A container that holds `restore-failed` is not restored. It counts as
+  `RestoreEndedByWorkload` only when the claim is the workload's or there is
+  none; when the agent had claimed the container, a workload that stopped
+  waiting for that restore ended a restore that did not finish, and the
+  restore is `RestoreFailed`.
+- After an agent restart, `restore-complete` says the restore finished only
+  when the agent's claim names the same container (or there is no claim, from
+  an agent before claims); one left by a restore into an earlier container of
+  the Pod is not taken for this one.
 - The restore proxy never claims a container, so with the proxy the agent's
   claim always succeeds and nothing changes.
 

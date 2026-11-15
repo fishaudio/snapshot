@@ -127,9 +127,12 @@ const (
 
 	// RestoreClaimFile decides who starts a destination container: the
 	// Snapshot agent, with a restore, or the container's own command, without
-	// one. Whoever creates it first, with an exclusive create (O_CREAT|O_EXCL),
-	// owns the container. Nobody removes or rewrites it, so it outlives the
-	// container's restarts.
+	// one. Whoever creates it first owns the container. It is created whole:
+	// its content is written to a temporary file in the same directory, which
+	// is then hard-linked to this name (linkat(2)); the link fails if the name
+	// exists, so it decides the claim as an exclusive create would, and the
+	// file is never seen empty. Nobody removes or rewrites it, so it outlives
+	// the container's restarts.
 	//
 	// The agent creates it before it touches a destination container or its
 	// GPUs for a restore, and before it ends one with restore-failed and a
@@ -252,10 +255,12 @@ func FormatRestoreClaim(c RestoreClaim) []byte {
 	return []byte(content)
 }
 
-// ParseRestoreClaim reads the content of RestoreClaimFile. Unknown keys are
-// ignored so either side can add fields without breaking older readers. A
-// claim without an owner does not parse: its creator may still be writing it,
-// or stopped before it did.
+// ParseRestoreClaim reads the content of RestoreClaimFile. Keys and values
+// are trimmed of spaces, and unknown keys are ignored so either side can add
+// fields without breaking older readers. A claim whose owner is missing, or
+// is neither ControlFileOwnerAgent nor ControlFileOwnerWorkload, does not
+// parse: its creator may still be writing it, or stopped before it did, or
+// speaks another protocol.
 func ParseRestoreClaim(data []byte) (RestoreClaim, error) {
 	var c RestoreClaim
 	seen := map[string]bool{}
@@ -264,7 +269,7 @@ func ParseRestoreClaim(data []byte) (RestoreClaim, error) {
 		if line == "" {
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
+		key, value, ok := cutControlLine(line)
 		if !ok {
 			return RestoreClaim{}, fmt.Errorf("invalid %s line %q: expected key=value", RestoreClaimFile, line)
 		}
@@ -281,10 +286,21 @@ func ParseRestoreClaim(data []byte) (RestoreClaim, error) {
 			c.ContainerID = value
 		}
 	}
-	if c.Owner == "" {
+	switch c.Owner {
+	case ControlFileOwnerAgent, ControlFileOwnerWorkload:
+		return c, nil
+	case "":
 		return RestoreClaim{}, fmt.Errorf("%s has no %s", RestoreClaimFile, ControlFileOwnerKey)
+	default:
+		return RestoreClaim{}, fmt.Errorf("%s has an unknown %s %q", RestoreClaimFile, ControlFileOwnerKey, c.Owner)
 	}
-	return c, nil
+}
+
+// cutControlLine splits a key=value line of a control file, trimming spaces
+// around the key and the value.
+func cutControlLine(line string) (key, value string, ok bool) {
+	key, value, ok = strings.Cut(line, "=")
+	return strings.TrimSpace(key), strings.TrimSpace(value), ok
 }
 
 // FormatAgentRestoreFailed renders what the agent writes into
@@ -299,7 +315,7 @@ func FormatAgentRestoreFailed() []byte {
 // not key=value are skipped rather than rejected.
 func RestoreFailedByAgent(data []byte) bool {
 	for line := range strings.Lines(string(data)) {
-		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		key, value, ok := cutControlLine(line)
 		if ok && key == ControlFileOwnerKey {
 			return value == ControlFileOwnerAgent
 		}

@@ -193,6 +193,7 @@ func TestRestoreFailedByAgent(t *testing.T) {
 	for name, data := range map[string]string{
 		"agent among other lines": "a workload's note\nowner=agent\n",
 		"padded":                  "  owner=agent  \n",
+		"spaced":                  "owner = agent\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if !RestoreFailedByAgent([]byte(data)) {
@@ -248,14 +249,24 @@ func TestParseRestoreClaim(t *testing.T) {
 			t.Fatalf("ParseRestoreClaim() = %+v, %v", got, err)
 		}
 	})
+	t.Run("trims spaces around keys and values", func(t *testing.T) {
+		got, err := ParseRestoreClaim([]byte("owner = agent\n container =abc123 \n"))
+		if err != nil || got != (RestoreClaim{Owner: ControlFileOwnerAgent, ContainerID: "abc123"}) {
+			t.Fatalf("ParseRestoreClaim() = %+v, %v", got, err)
+		}
+	})
 
 	// A creator that stopped before writing, or is still writing, leaves a
-	// claim without an owner.
+	// claim without an owner; one that speaks another protocol names another.
 	for name, data := range map[string]string{
 		"empty":           "",
 		"no owner":        "container=abc123\n",
 		"free text":       "claimed\n",
 		"duplicate owner": "owner=agent\nowner=workload\n",
+		"empty owner":     "owner=\n",
+		"unknown owner":   "owner=operator\n",
+		"partial owner":   "owner=work",
+		"owner in case":   "owner=Agent\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got, err := ParseRestoreClaim([]byte(data)); err == nil {

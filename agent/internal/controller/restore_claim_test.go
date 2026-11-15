@@ -354,3 +354,147 @@ func TestRestoreVerdictWhenWorkloadsStartedWithoutARestoreInDifferentWays(t *tes
 	assert.Equal(t, podcontract.RestoreReasonClaimedByWorkload, all.reason)
 	assert.Equal(t, podcontract.RestoreReasonEndedByWorkload, mixed.reason)
 }
+
+// A claim made by a writer that creates the file before it writes it can be
+// read empty for a moment. The agent reads it again before it decides the
+// claim is not the workload's.
+func TestAClaimReadEmptyIsReadAgain(t *testing.T) {
+	h := newClaimHarness(t)
+	h.volume.write("main", podcontract.RestoreClaimFile, claimedBy(podcontract.ControlFileOwnerWorkload, ""))
+	readVolume := h.w.readControlFileFn
+	reads := 0
+	h.w.readControlFileFn = func(pid int, name string) ([]byte, bool, error) {
+		if name == podcontract.RestoreClaimFile {
+			reads++
+			if reads <= 2 {
+				return nil, true, nil
+			}
+		}
+		return readVolume(pid, name)
+	}
+
+	processQueuedRestorePod(t, h.w, h.pod)
+
+	assert.Equal(t, podcontract.RestoreReasonClaimedByWorkload, appliedRestoredCondition(t, h.w).Reason)
+	assert.Equal(t, 3, reads)
+	assert.Empty(t, h.volume.kills())
+	assert.False(t, h.volume.holds("main", podcontract.RestoreFailedFile))
+}
+
+// A claim whose owner is neither the agent nor the workload, here or from an
+// earlier container, keeps the restore out without a kill, and restore-failed
+// tells a waiting workload at once that no restore is coming.
+func TestAClaimWithAnUnknownOwnerKeepsTheRestoreOut(t *testing.T) {
+	for name, owner := range map[string]string{
+		"another owner":     "operator",
+		"another spelling":  "Workload",
+		"no owner at all":   "",
+		"a cut-short owner": "work",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newClaimHarness(t)
+			h.volume.write("main", podcontract.RestoreClaimFile, "owner="+owner+"\n")
+
+			processQueuedRestorePod(t, h.w, h.pod)
+
+			condition := appliedRestoredCondition(t, h.w)
+			assert.Equal(t, podcontract.RestoreReasonFailed, condition.Reason)
+			assert.Contains(t, condition.Message, "holds a restore claim that cannot be read")
+			assert.Empty(t, h.volume.kills())
+			assert.Equal(t, string(podcontract.FormatAgentRestoreFailed()), h.volume.read("main", podcontract.RestoreFailedFile))
+		})
+	}
+}
+
+// After an agent restart, restore-complete says the restore finished only
+// when the agent's claim is for this container. One left by a restore into an
+// earlier container of the Pod does not make the container that started
+// since, without a restore, count as restored.
+func TestRecoveryTrustsRestoreCompleteOnlyForTheClaimedContainer(t *testing.T) {
+	for name, tc := range map[string]struct {
+		claim      string
+		restart    bool
+		wantReason string
+	}{
+		"the claimed container": {
+			claim:      claimedBy(podcontract.ControlFileOwnerAgent, testContainerID),
+			wantReason: podcontract.RestoreReasonSucceeded,
+		},
+		// An agent from before claims restored it.
+		"no claim": {
+			wantReason: podcontract.RestoreReasonSucceeded,
+		},
+		"a container that started since": {
+			claim:      claimedBy(podcontract.ControlFileOwnerAgent, testContainerID),
+			restart:    true,
+			wantReason: podcontract.RestoreReasonFailed,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newClaimHarness(t)
+			h.recovering()
+			h.volume.write("main", podcontract.RestoreCompleteFile, "pid=7\n")
+			if tc.claim != "" {
+				h.volume.write("main", podcontract.RestoreClaimFile, tc.claim)
+			}
+			if tc.restart {
+				h.restart()
+			}
+
+			processQueuedRestorePod(t, h.w, h.pod)
+
+			assert.Equal(t, tc.wantReason, appliedRestoredCondition(t, h.w).Reason)
+			assert.Empty(t, h.volume.kills())
+		})
+	}
+}
+
+// restore-failed that the workload wrote reads as a workload that gave up
+// first only when the claim is not the agent's. A workload that waited for a
+// restore the agent had claimed, and stopped waiting, ends a restore that did
+// not finish: a failure.
+func TestRestoreFailedFromTheWorkloadIsAFailureWhenTheAgentHadClaimed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		claim      string
+		restart    bool
+		wantReason string
+	}{
+		"claimed by the agent for this container": {
+			claim:      claimedBy(podcontract.ControlFileOwnerAgent, testContainerID),
+			wantReason: podcontract.RestoreReasonFailed,
+		},
+		"claimed by the agent for an earlier container": {
+			claim:      claimedBy(podcontract.ControlFileOwnerAgent, testContainerID),
+			restart:    true,
+			wantReason: podcontract.RestoreReasonFailed,
+		},
+		"a claim that cannot be read": {
+			claim:      "owner=operator\n",
+			wantReason: podcontract.RestoreReasonFailed,
+		},
+		"claimed by the workload": {
+			claim:      claimedBy(podcontract.ControlFileOwnerWorkload, ""),
+			wantReason: podcontract.RestoreReasonEndedByWorkload,
+		},
+		"not claimed": {
+			wantReason: podcontract.RestoreReasonEndedByWorkload,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newClaimHarness(t)
+			h.volume.write("main", podcontract.RestoreFailedFile, workloadGaveUp)
+			if tc.claim != "" {
+				h.volume.write("main", podcontract.RestoreClaimFile, tc.claim)
+			}
+			if tc.restart {
+				h.restart()
+			}
+
+			processQueuedRestorePod(t, h.w, h.pod)
+
+			assert.Equal(t, tc.wantReason, appliedRestoredCondition(t, h.w).Reason)
+			assert.Empty(t, h.volume.kills())
+			assert.Equal(t, workloadGaveUp, h.volume.read("main", podcontract.RestoreFailedFile))
+		})
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -216,6 +217,48 @@ func TestClaimControlFile(t *testing.T) {
 	if got := readSentinel(t, path); got != "owner=agent\n" {
 		t.Fatalf("a lost claim changed the claim to %q", got)
 	}
+	assertOnlyEntries(t, controlDir, "restore-claim")
+}
+
+// assertOnlyEntries checks that dir holds exactly names: a claim leaves no
+// temporary file behind, won or lost.
+func assertOnlyEntries(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, entry := range entries {
+		got = append(got, entry.Name())
+	}
+	if !slices.Equal(got, names) {
+		t.Fatalf("%s holds %q, want %q", dir, got, names)
+	}
+}
+
+// claimByLink claims path the way ClaimControlFile does, as a workload's
+// command would: the content in a temporary file, then a hard link.
+func claimByLink(path, contents string) (bool, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".workload-claim.*")
+	if err != nil {
+		return false, err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(contents); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Link(tmp.Name(), path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // The workload claims first: the agent's claim finds it and changes nothing.
@@ -234,6 +277,7 @@ func TestClaimControlFileAfterTheWorkload(t *testing.T) {
 	if got := readSentinel(t, path); got != "owner=workload\n" {
 		t.Fatalf("claim holds %q", got)
 	}
+	assertOnlyEntries(t, controlDir, "restore-claim")
 }
 
 // Whatever the workload put under the name is a claim the agent did not make,
@@ -256,34 +300,59 @@ func TestClaimControlFileNeverFollowsWhatIsThere(t *testing.T) {
 }
 
 // The agent and the workload race for the claim many times over: each time
-// exactly one of them creates it.
+// exactly one of them creates it, and nobody ever reads it empty or cut short.
 func TestClaimControlFileHasOneWinner(t *testing.T) {
+	const agentClaim, workloadClaim = "owner=agent\ncontainer=abc123\n", "owner=workload\n"
 	for range 200 {
 		procRoot, pid, controlDir := fakeContainer(t)
+		path := filepath.Join(controlDir, "restore-claim")
 		var agentWon, workloadWon atomic.Int32
-		var racers sync.WaitGroup
-		start := make(chan struct{})
+		var racers, readers sync.WaitGroup
+		start, done := make(chan struct{}), make(chan struct{})
+		var seen sync.Map
+		for range 2 {
+			readers.Go(func() {
+				<-start
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					if data, err := os.ReadFile(path); err == nil {
+						seen.Store(string(data), true)
+					}
+				}
+			})
+		}
 		for range 4 {
 			racers.Go(func() {
 				<-start
-				if created, err := claimControlFile(procRoot, pid, "restore-claim", []byte("owner=agent\n")); err == nil && created {
+				if created, err := claimControlFile(procRoot, pid, "restore-claim", []byte(agentClaim)); err == nil && created {
 					agentWon.Add(1)
 				}
 			})
 			racers.Go(func() {
 				<-start
-				f, err := os.OpenFile(filepath.Join(controlDir, "restore-claim"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-				if err == nil {
+				if created, err := claimByLink(path, workloadClaim); err == nil && created {
 					workloadWon.Add(1)
-					_ = f.Close()
 				}
 			})
 		}
 		close(start)
 		racers.Wait()
+		close(done)
+		readers.Wait()
 		if winners := agentWon.Load() + workloadWon.Load(); winners != 1 {
 			t.Fatalf("%d racers created the claim, want 1", winners)
 		}
+		seen.Range(func(data, _ any) bool {
+			if data != agentClaim && data != workloadClaim {
+				t.Fatalf("a reader saw the claim as %q", data)
+			}
+			return true
+		})
+		assertOnlyEntries(t, controlDir, "restore-claim")
 	}
 }
 
