@@ -19,7 +19,7 @@ Status as of 2026-11-15.
 | 5 | `efa13477` | capture a Pod's containers one after the other | not covered |
 | 6 | `dfcf8c2e` | end a restore that will not run (refusal, `config.restore.snapshotWaitSeconds`) | not covered; overlaps open designs #800 (SNEP-322), #836 (SNEP-247) |
 | 7 | `3038962f` | own condition reasons for restores that did not run (`RestoreSnapshotNotReady`, `RestoreEndedByWorkload`) | not covered; reasons may collide with the restore-retry stack (#899, #902) |
-| 8 | `41161579` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
+| 8 | `41161579`, `df4f9e29` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
 
 None of the patches has an upstream issue or pull request yet.
 
@@ -379,11 +379,15 @@ Commit `3038962f` `feat(agent): give restores that did not run their own conditi
 
 ## 8. Claim a destination container before restoring into it
 
-Commit `41161579` `fix(agent): claim a destination container before restoring into it`.
+Commits `41161579` `fix(agent): claim a destination container before restoring into it`
+and `df4f9e29` `fix(agent): create the restore claim whole and judge outcomes by it`
+(the fixes from a joint review of both halves; squash them when the branch is
+rebuilt).
 
 - **What**: the agent claims each destination container, by creating
-  `restore-claim` in its control directory with an exclusive create, before
-  it restores into it and before it ends it with `restore-failed` and a kill.
+  `restore-claim` in its control directory whole (a temporary file
+  hard-linked to that name, which fails if it exists), before it restores
+  into it and before it ends it with `restore-failed` and a kill.
   A container whose workload claimed it first is left alone, and the restore
   reports `RestoreClaimedByWorkload`. The claim is never removed. The protocol
   is below; the workload half is the Kamin entrypoint's restore claim
@@ -415,9 +419,16 @@ Commit `41161579` `fix(agent): claim a destination container before restoring in
   unreadable one; claim error fails the restore; ending a restore kills only
   containers the agent claimed; a refusal after the claim still ends the
   container; each destination of a restore-from-map Pod claimed on its own;
-  verdict when destinations were declined in different ways). The test
+  verdict when destinations were declined in different ways; a claim read
+  empty is read again; unknown owners; recovery trusts `restore-complete` only
+  for the claimed container; the workload's `restore-failed` under the
+  agent's claim is a failure). The runtime race test also has readers that
+  never see the claim empty, and checks no temporary file is left. The test
   runtime now resolves a placeholder by default, since every restore claims
   through one; tests that need resolution to fail say so.
+  `runtime/claim_workload_test.go` races the agent's claim against a real
+  workload entrypoint for 300 rounds, at random moments around its deadline;
+  it runs only with `KAMIN_ENTRYPOINT_BIN` set to the binary.
 - **Upstream**: not covered; nothing upstream lets a workload and the agent
   agree on who starts a destination container. Collisions:
   [#884](https://github.com/ai-dynamo/snapshot/pull/884) (SNEP-883, restore on
@@ -446,25 +457,42 @@ against it.
   agent reaches it through `/host/proc/<placeholder PID>/root`, resolving the
   path inside the container's root. It is a reserved control file
   (`podcontract.IsReservedControlFile`).
-- **Claiming**: one `open`/`openat` with `O_WRONLY|O_CREAT|O_EXCL` (the agent
-  adds `O_NOFOLLOW|O_CLOEXEC` and sets mode `0644`, so a workload running as
-  another user can read its claim; the agent reads any claim as root). Whoever's create succeeds owns the container until
-  the Pod is deleted. `EEXIST` means someone else claimed it; the content does
-  not change who owns it.
-- **Content**: `key=value` lines ending in `\n`, written right after the
-  create; unknown keys are ignored. The agent writes
-  `owner=agent\ncontainer=<runtime container ID, without the CRI scheme>\n`;
-  the workload writes `owner=workload\n`. The content can be empty for a
-  moment, or for good if its creator stopped before writing it.
+- **Claiming, created whole**: write the content into a temporary file in the
+  same directory (the agent: `.restore-claim.<random>`, created with
+  `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, mode `0644` so a workload
+  running as another user can read it; the agent reads any claim as root),
+  then `linkat(2)` it to `restore-claim`, then remove the temporary file. Whoever's
+  link succeeds owns the container until the Pod is deleted. `EEXIST` means
+  someone else claimed it. The claim is never visible empty or cut short; a
+  temporary file left behind by a crash is only litter. A failure other than
+  `EEXIST` decides nothing (the agent fails the restore; the entrypoint exits
+  2).
+- **Content**: `key=value` lines ending in `\n`; spaces around keys and
+  values are trimmed on both sides, and unknown keys are ignored. The agent
+  writes `owner=agent\ncontainer=<runtime container ID, without the CRI
+  scheme>\n`; the workload writes `owner=workload\n`. `owner` must be exactly
+  `agent` or `workload` after trimming; anything else, a missing `owner`
+  included, makes the claim unreadable. The agent reads a claim that does not
+  parse again, up to 5 times 20 ms apart, before it takes it as unreadable;
+  with both sides linking, this only covers writers that create the file
+  before they write it.
 - **Nobody removes, renames or rewrites it**, the agent's clearing of
   `restore-complete` and `restore-failed` before CRIU included. It outlives the
   container's restarts.
 - **Agent, restoring** (`runRestore`): (1) with the Pod `RestoreInProgress`
   after an agent restart and `restore-complete` present, only the post-restore
-  action runs, without a claim; (2) a container holding `restore-failed` is
-  refused, `RestoreEndedByWorkload` unless the file says `owner=agent`
-  (patch 7); (3) the claim; (4) only then `executor.Restore`: artifact
-  metadata, placeholder inspection, bundle mount into the container,
+  action runs, without a new claim, and only if the claim is the agent's for
+  this container (or there is no claim at all, from an agent before claims):
+  a `restore-complete` left by a restore into an earlier container of the Pod
+  does not make a container that started since count as restored; (2) a
+  container holding `restore-failed` is refused: `RestoreFailed` if the file
+  says `owner=agent` or the claim is not the workload's (the agent's for this
+  or an earlier container, or unreadable), so a workload that waited out the
+  agent's claim and exited 114 is never paired with a reason that does not
+  count; `RestoreEndedByWorkload` if the claim is the workload's or there is
+  none; (3) the claim; (4) only then `executor.Restore`: artifact metadata,
+  placeholder inspection with the second compatibility check
+  (`executor/restore.go`, `inspectRestore`), bundle mount into the container,
   PageBroker staging onto the GPUs, `nsrestore` (rootfs diff, clearing of
   `restore-complete`/`restore-failed`, CRIU, CUDA); (5) `restore-complete`;
   (6) the post-restore action. What the claim finds decides:
@@ -473,9 +501,9 @@ against it.
   |---|---|---|
   | created now | restores | as before |
   | `owner=agent`, `container=` this container | restores: the agent restarted after it claimed | as before |
-  | `owner=` anything but `agent` | nothing: no restore, no kill, no file written | `RestoreClaimedByWorkload` when every destination was claimed so, else listed in the Pod's message |
+  | `owner=workload` | nothing: no restore, no kill, no file written | `RestoreClaimedByWorkload` when every destination was claimed so, else listed in the Pod's message |
   | `owner=agent`, another container (an earlier one of this Pod) | no restore, no kill; writes `restore-failed` (`owner=agent`) unless present | `RestoreFailed` |
-  | empty, no `owner`, not a regular file, or gone | as the row above | `RestoreFailed` |
+  | empty, no `owner`, an `owner` other than `agent`/`workload`, not a regular file, or gone | as the row above | `RestoreFailed` |
   | create fails other than `EEXIST`, or the container cannot be resolved | fails the restore: `restore-failed`, kill | `RestoreFailed` |
 
 - **Agent, ending a restore** (refusal, failed preflight, snapshot wait;
@@ -506,8 +534,14 @@ against it.
   nothing.
 - **Timing**: the workload's first deadline (`KAMIN_RESTORE_TIMEOUT`, from its
   own start) covers the agent's snapshot wait (`snapshotWaitSeconds`, from the
-  container's start) and the preflight; the agent claims only after those. If
-  the agent holds the claim at that deadline, the workload waits one more
+  container's start) and the preflight with its first compatibility check;
+  the agent claims only after those. Everything else runs after the claim:
+  reading the artifact's metadata, inspecting the placeholder with the second
+  compatibility check, mounting into the container, PageBroker staging and
+  the restore itself. A container the second check refuses is ended at once
+  (`restore-failed`, kill: `RestoreIncompatible`), so a refusal after the
+  claim does not run into the workload's second wait. If the agent holds the
+  claim at the first deadline, the workload waits one more
   `KAMIN_RESTORE_TIMEOUT`, so a claimed restore gets at least that long. The
   agent's own bound is `config.restore.timeoutSeconds` (default 7200 s), far
   longer: a restore that outlasts the workload's second wait is cut by the
