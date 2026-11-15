@@ -1,11 +1,12 @@
 # Patches carried by this fork
 
 `kamin/main` is upstream [ai-dynamo/snapshot](https://github.com/ai-dynamo/snapshot)
-`v0.3.0` plus the six patches below, one commit each, in this order, then one
+`v0.3.0` plus patches 1–6 below, one commit each, in this order, then one
 `ci(kamin)` commit (`.github/workflows/kamin-release.yaml`,
-`.github/kamin/package-chart.sh`) and this file. Nothing else differs from
-upstream. Every patch is meant to go upstream; the fork exists until they are
-merged there.
+`.github/kamin/package-chart.sh`) and this file. Patches 7 and 8 follow, one
+commit each, on the branch `kamin/restore-claim` until they are merged into
+`kamin/main`. Nothing else differs from upstream. Every patch is meant to go
+upstream; the fork exists until they are merged there.
 
 Status as of 2026-11-15.
 
@@ -17,6 +18,8 @@ Status as of 2026-11-15.
 | 4 | `cd86f4d3` | chart value `daemonset.restoreProxy.enabled` | not covered; naming at risk from #893 |
 | 5 | `efa13477` | capture a Pod's containers one after the other | not covered |
 | 6 | `dfcf8c2e` | end a restore that will not run (refusal, `config.restore.snapshotWaitSeconds`) | not covered; overlaps open designs #800 (SNEP-322), #836 (SNEP-247) |
+| 7 | `3038962f` | own condition reasons for restores that did not run (`RestoreSnapshotNotReady`, `RestoreEndedByWorkload`) | not covered; reasons may collide with the restore-retry stack (#899, #902) |
+| 8 | `41161579` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
 
 None of the patches has an upstream issue or pull request yet.
 
@@ -324,6 +327,203 @@ Commit `dfcf8c2e` `fix(agent): end a restore that will not run instead of leavin
 - **Status**: fork only. Changes restore semantics: needs an approved issue
   and agreement with the SNEP-322/SNEP-247 authors.
 
+## 7. Own condition reasons for restores that did not run
+
+Commit `3038962f` `feat(agent): give restores that did not run their own condition reasons`.
+
+- **What**: two outcomes of the `nvidia.com/Restored` condition that were
+  `RestoreFailed` get their own reason. `RestoreSnapshotNotReady`: the agent
+  ended the restore because its PodSnapshots were not ready to restore within
+  `config.restore.snapshotWaitSeconds` (patch 6); the message is unchanged
+  (`Stopped waiting for the snapshot after ...`). `RestoreEndedByWorkload`:
+  every destination container already held a `restore-failed` that its
+  workload wrote, so the agent left it alone; the message is
+  `Restore from <PodSnapshots> did not run: the workload of N destination
+  container(s) started without a restore first: <destination>: <cause>; ...`.
+  Both classify as `Failed` in `podcontract.ClassifyRestoreOutcome`, so the
+  agent treats them as terminal. To tell its own `restore-failed` from the
+  workload's, the agent now writes `owner=agent` into the file (it wrote
+  `failed`, and PageBroker restores `restore failed`);
+  `podcontract.RestoreFailedByAgent` reads it, line by line, skipping lines
+  that are not `key=value`. A destination whose `restore-failed` is the
+  agent's (a restore it failed or ended in an earlier pass or agent) stays a
+  failure. A Pod whose destinations ended in different ways keeps
+  `RestorePartiallySucceeded`, `RestoreIncompatible` or `RestoreFailed`, and
+  the message lists every destination's cause. Other reasons are unchanged.
+- **Why**: whoever counts failed restores against a snapshot (a controller
+  that disables a bad snapshot after N failures) must not count a snapshot
+  that was not ready yet, or a workload that gave up waiting before the agent
+  began; until now only the message told them apart.
+- **Files**: `api/podcontract/{protocol,restore_status}.go`,
+  `agent/internal/controller/{controller,restore_end}.go`,
+  `agent/internal/runtime/control.go` (`ReadControlFile`: bounded, regular
+  files only, no symlinks, no blocking on a FIFO),
+  `agent/internal/executor/restore.go`, docs (`troubleshooting.md`,
+  `restore-pod-contract.md`, snapshotctl README), `CHANGELOG.md`.
+- **Tests**: `podcontract/{protocol,restore_status}_test.go` (owner parsing,
+  classification), `runtime/control_test.go` (`ReadControlFile`),
+  `controller/restore_end_test.go` (snapshot wait reason, workload's marker,
+  agent's marker, several destinations ending differently, verdict table). The
+  e2e helpers' lists of terminal reasons (`e2e/snapshot_e2e/lifecycle.py`)
+  were left as they are: they still list only the three old reasons, so an e2e
+  wait sees the new ones as not terminal and times out instead of failing
+  early.
+- **Upstream**: not covered: upstream reports both as `RestoreFailed`
+  (upstream has no snapshot wait; that is patch 6). The restore-retry drafts
+  add reasons of their own around attempts (#899, #902); agree on names there.
+- **Against upstream main**: builds on patch 6 (`restore_end.go`); the code
+  otherwise applies where patch 6 does. `controller.go` is also touched by
+  #902 and #906.
+- **Status**: fork only. New condition reasons are a public API change: needs
+  an approved issue, together with patch 6.
+
+## 8. Claim a destination container before restoring into it
+
+Commit `41161579` `fix(agent): claim a destination container before restoring into it`.
+
+- **What**: the agent claims each destination container, by creating
+  `restore-claim` in its control directory with an exclusive create, before
+  it restores into it and before it ends it with `restore-failed` and a kill.
+  A container whose workload claimed it first is left alone, and the restore
+  reports `RestoreClaimedByWorkload`. The claim is never removed. The protocol
+  is below; the workload half is the Kamin entrypoint's restore claim
+  (`docs/usage.md`, section 恢复认领, in the Kamin repository).
+- **Why**: on a node without the restore proxy the destination container runs
+  its own command, which gives up waiting for the restore after its own
+  timeout and starts the workload without one. The agent read the
+  `restore-failed` such a command writes only before the restore began
+  (patch 6), and the restore cleared it before CRIU (`nsrestore`), so a
+  restore slower than the workload's wait ran into a container that was
+  already running the workload: two engines on one GPU.
+- **Files**: `api/podcontract/{protocol,restore_status}.go`,
+  `agent/internal/runtime/control.go` (`ClaimControlFile`),
+  `agent/internal/controller/{restore_claim,restore_end,controller}.go`,
+  `agent/internal/executor/nsrestore.go` (`clearRestoreOutcome`, which keeps
+  the claim), docs (`restore-pod-contract.md` section "Claiming the
+  container", `troubleshooting.md`, snapshotctl README), `CHANGELOG.md`.
+- **Tests**: `runtime/control_test.go` (claim created once, a second claim and
+  the workload's `O_EXCL` after it fail, the workload first, symlinks not
+  followed, 200 rounds of 4 agent and 4 workload racers with exactly one
+  winner, missing control directory), `executor/nsrestore_test.go` (clearing
+  the outcome keeps the claim), `podcontract/protocol_test.go` (format, parse,
+  own claim), `controller/restore_claim_test.go` (the claim exists before the
+  restore starts and the workload's claim then fails; workload claimed first:
+  no restore, no kill, nothing written, `RestoreClaimedByWorkload`; agent
+  restart after claiming, same container: restores; container restarted
+  since: no restore, no kill, `restore-failed`, `RestoreFailed`; claims left
+  by an earlier container of the Pod: the workload's, the agent's, an
+  unreadable one; claim error fails the restore; ending a restore kills only
+  containers the agent claimed; a refusal after the claim still ends the
+  container; each destination of a restore-from-map Pod claimed on its own;
+  verdict when destinations were declined in different ways). The test
+  runtime now resolves a placeholder by default, since every restore claims
+  through one; tests that need resolution to fail say so.
+- **Upstream**: not covered; nothing upstream lets a workload and the agent
+  agree on who starts a destination container. Collisions:
+  [#884](https://github.com/ai-dynamo/snapshot/pull/884) (SNEP-883, restore on
+  container restart) restores into a restarted container, which the permanent
+  claim forbids; the claim would have to be per container there.
+  [#836](https://github.com/ai-dynamo/snapshot/pull/836) (SNEP-247, retrying
+  a failed restore) and its drafts (#895–#906) retry in the same Pod; a retry
+  into the same container passes (the agent's own claim), one into a restarted
+  container does not. [#800](https://github.com/ai-dynamo/snapshot/pull/800)
+  (SNEP-322, cold-start fallback) is the upstream design for the workload
+  starting without a restore; the claim is a mechanism it could adopt.
+- **Against upstream main**: builds on patches 6 and 7 (`restore_end.go`,
+  `restoreDeclinedError`). #902 (pick a restore up after an agent restart)
+  rewrites the same part of `runRestore`.
+- **Status**: fork only. A new control file and restore semantics: needs an
+  approved issue, likely together with SNEP-322.
+
+### The restore claim protocol
+
+Both sides must follow this exactly; the Kamin entrypoint's half is checked
+against it.
+
+- **File**: `restore-claim` in the destination container's control directory,
+  `$SNAPSHOT_CONTROL_DIR/restore-claim` (`/snapshot-control/restore-claim`,
+  the container's `subPath` of the Pod's `snapshot-control` emptyDir). The
+  agent reaches it through `/host/proc/<placeholder PID>/root`, resolving the
+  path inside the container's root. It is a reserved control file
+  (`podcontract.IsReservedControlFile`).
+- **Claiming**: one `open`/`openat` with `O_WRONLY|O_CREAT|O_EXCL` (the agent
+  adds `O_NOFOLLOW|O_CLOEXEC` and sets mode `0644`, so a workload running as
+  another user can read its claim; the agent reads any claim as root). Whoever's create succeeds owns the container until
+  the Pod is deleted. `EEXIST` means someone else claimed it; the content does
+  not change who owns it.
+- **Content**: `key=value` lines ending in `\n`, written right after the
+  create; unknown keys are ignored. The agent writes
+  `owner=agent\ncontainer=<runtime container ID, without the CRI scheme>\n`;
+  the workload writes `owner=workload\n`. The content can be empty for a
+  moment, or for good if its creator stopped before writing it.
+- **Nobody removes, renames or rewrites it**, the agent's clearing of
+  `restore-complete` and `restore-failed` before CRIU included. It outlives the
+  container's restarts.
+- **Agent, restoring** (`runRestore`): (1) with the Pod `RestoreInProgress`
+  after an agent restart and `restore-complete` present, only the post-restore
+  action runs, without a claim; (2) a container holding `restore-failed` is
+  refused, `RestoreEndedByWorkload` unless the file says `owner=agent`
+  (patch 7); (3) the claim; (4) only then `executor.Restore`: artifact
+  metadata, placeholder inspection, bundle mount into the container,
+  PageBroker staging onto the GPUs, `nsrestore` (rootfs diff, clearing of
+  `restore-complete`/`restore-failed`, CRIU, CUDA); (5) `restore-complete`;
+  (6) the post-restore action. What the claim finds decides:
+
+  | Claim | The agent | Outcome |
+  |---|---|---|
+  | created now | restores | as before |
+  | `owner=agent`, `container=` this container | restores: the agent restarted after it claimed | as before |
+  | `owner=` anything but `agent` | nothing: no restore, no kill, no file written | `RestoreClaimedByWorkload` when every destination was claimed so, else listed in the Pod's message |
+  | `owner=agent`, another container (an earlier one of this Pod) | no restore, no kill; writes `restore-failed` (`owner=agent`) unless present | `RestoreFailed` |
+  | empty, no `owner`, not a regular file, or gone | as the row above | `RestoreFailed` |
+  | create fails other than `EEXIST`, or the container cannot be resolved | fails the restore: `restore-failed`, kill | `RestoreFailed` |
+
+- **Agent, ending a restore** (refusal, failed preflight, snapshot wait;
+  `endDestination`): a container holding `restore-failed` or
+  `restore-complete` is left alone, as before; otherwise the agent claims it.
+  Created or its own: `restore-failed`, then the kill. The workload's: nothing.
+  Any other: `restore-failed` unless present, no kill. If the claim cannot be
+  decided, it ends the container anyway, as it does when it cannot read
+  `restore-failed`. A container with no running process gets `restore-failed`
+  through the node's path of the volume, without a claim.
+- **Workload** (what the agent expects; the Kamin entrypoint implements it):
+  in a restore container, claim before every start without a restore. Created,
+  or the claim says `owner=workload` (its own, from an earlier container of the
+  Pod): write `restore-failed`, then start. Anything else, empty and unreadable
+  included, is the agent's: do not start; wait for `restore-complete` (resume)
+  or `restore-failed` (exit; the next container starts) up to a limit, then
+  write `restore-failed` and exit (the entrypoint: 114). A container that finds
+  `restore-failed` or `restore-complete` when it starts may start without
+  claiming: the agent refuses `restore-failed` before it claims, and the claim
+  left by the restore that wrote `restore-complete` keeps it out. If the
+  create fails other than `EEXIST`, do not start (the entrypoint exits 2).
+- **Why the agent writes `restore-failed` for a claim that is neither its own
+  nor the workload's**: the workload reads such a claim as the agent's and
+  waits for its outcome, and the restore proxy waits with no limit. The agent
+  will not restore there, so `restore-failed` is the outcome it owes. Without
+  it the entrypoint waits one more `KAMIN_RESTORE_TIMEOUT` and exits 114, and
+  the proxy waits forever. When the workload holds the claim the agent writes
+  nothing.
+- **Timing**: the workload's first deadline (`KAMIN_RESTORE_TIMEOUT`, from its
+  own start) covers the agent's snapshot wait (`snapshotWaitSeconds`, from the
+  container's start) and the preflight; the agent claims only after those. If
+  the agent holds the claim at that deadline, the workload waits one more
+  `KAMIN_RESTORE_TIMEOUT`, so a claimed restore gets at least that long. The
+  agent's own bound is `config.restore.timeoutSeconds` (default 7200 s), far
+  longer: a restore that outlasts the workload's second wait is cut by the
+  workload, which writes `restore-failed` and exits 114. The container's PID
+  namespace ends with it, taking any restored process along, and the agent's
+  restore then fails (`RestoreFailed`, counted against the snapshot). So keep
+  `KAMIN_RESTORE_TIMEOUT` above the snapshot wait plus the restore's p99 plus a
+  margin, and, to have the agent report a slow restore itself, keep
+  `config.restore.timeoutSeconds` below the workload's second wait; that value
+  applies to every restore on the node. Not measured on a GPU yet.
+- **Known edge**: if the workload gives up at its limit while `nsrestore` is
+  about to clear the sentinels, `nsrestore` may remove the workload's
+  `restore-failed`. The workload exits anyway, so no two engines; its next
+  container finds the agent's claim without an outcome and waits again until
+  the agent's failed restore writes `restore-failed`, or exits 114 once more.
+
 ## How far upstream has moved
 
 As of 2026-11-15 upstream main is at `94b6fa2a` (2026-11-13). `v0.3.0` is on
@@ -372,6 +572,10 @@ the related designs settle.
    issue (likely a SNEP) next to the pod-group API (#612/#811) and the
    prefill/decode use case (#847). The other five do not depend on it once
    patch 2 drops its hunk.
+7. **Patches 7 and 8** (reasons, restore claim): after patch 6, which they
+   build on. Patch 7 can go with patch 6's issue. Patch 8 is a new contract
+   between the agent and the workload; raise it on SNEP-322 (#800), and
+   settle how it fits SNEP-883 (#884) and SNEP-247 (#836) first.
 
 ## Contributing upstream
 
