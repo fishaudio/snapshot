@@ -465,8 +465,8 @@ against it.
   link succeeds owns the container until the Pod is deleted. `EEXIST` means
   someone else claimed it. The claim is never visible empty or cut short; a
   temporary file left behind by a crash is only litter. A failure other than
-  `EEXIST` decides nothing (the agent fails the restore; the entrypoint exits
-  2).
+  `EEXIST` gives the claimer no claim: the agent then fails the restore
+  (`restore-failed` if it can, kill); the entrypoint's handling is below.
 - **Content**: `key=value` lines ending in `\n`; spaces around keys and
   values are trimmed on both sides, and unknown keys are ignored. The agent
   writes `owner=agent\ncontainer=<runtime container ID, without the CRI
@@ -524,7 +524,15 @@ against it.
   `restore-failed` or `restore-complete` when it starts may start without
   claiming: the agent refuses `restore-failed` before it claims, and the claim
   left by the restore that wrote `restore-complete` keeps it out. If the
-  create fails other than `EEXIST`, do not start (the entrypoint exits 2).
+  create fails other than `EEXIST`, the entrypoint (`69f6169`) starts without
+  a restore on `ENOSPC`, `EDQUOT` and `EROFS`, reasoning that the agent cannot
+  claim in the same directory either, and exits 2 on anything else, such as
+  `EACCES`. **Open risk**: that reasoning holds for `EROFS`, but not always for
+  `ENOSPC`/`EDQUOT`: on ext4 the blocks reserved for root, and quotas that
+  exempt root, still let the agent, which runs as root, create its claim when
+  a workload running as another user cannot. The agent would then restore into
+  a container that is starting without one. Until that is settled, a workload
+  that is not root should treat `ENOSPC`/`EDQUOT` like `EACCES`.
 - **Why the agent writes `restore-failed` for a claim that is neither its own
   nor the workload's**: the workload reads such a claim as the agent's and
   waits for its outcome, and the restore proxy waits with no limit. The agent
