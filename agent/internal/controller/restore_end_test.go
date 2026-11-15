@@ -87,6 +87,19 @@ func (v *controlVolume) install(w *NodeController) {
 		contents, exists := v.files[container][name]
 		return slices.Clone(contents), exists, nil
 	}
+	w.claimControlFileFn = func(pid int, name string, contents []byte) (bool, error) {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		container, ok := v.pids[pid]
+		if !ok {
+			return false, fmt.Errorf("no process %d", pid)
+		}
+		if _, exists := v.files[container][name]; exists {
+			return false, nil
+		}
+		v.put(container, name, contents)
+		return true, nil
+	}
 	w.sendSignalFn = func(_ logr.Logger, pid int, _ syscall.Signal, _ string) error {
 		v.mu.Lock()
 		defer v.mu.Unlock()

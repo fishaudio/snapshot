@@ -212,6 +212,49 @@ func controlSentinelExists(procRoot string, hostPID int, name string) (bool, err
 	return true, nil
 }
 
+// ClaimControlFile creates name in the workload container's snapshot-control
+// volume, holding contents, only if nothing exists under that name. The one
+// exclusive create (O_CREAT|O_EXCL) is what decides a claim between the agent
+// and the workload, so it reports whether this call created the file. Whatever
+// exists under the name already is left as it is, never followed: false,
+// without error. created is also true when writing contents failed after the
+// create: the claim is made all the same.
+func ClaimControlFile(hostPID int, name string, contents []byte) (created bool, err error) {
+	return claimControlFile(HostProcPath, hostPID, name, contents)
+}
+
+func claimControlFile(procRoot string, hostPID int, name string, contents []byte) (bool, error) {
+	if name == "" || name != filepath.Base(name) || name == ".." {
+		return false, fmt.Errorf("invalid control file name %q", name)
+	}
+	dir, err := openContainerControlDir(procRoot, hostPID)
+	if err != nil {
+		return false, fmt.Errorf("control file %q: %w", name, err)
+	}
+	defer dir.Close()
+	return createFileInDir(dir, name, contents)
+}
+
+// createFileInDir creates name in dir with contents, as ClaimControlFile does.
+func createFileInDir(dir *os.File, name string, contents []byte) (bool, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
+	if errors.Is(err, unix.EEXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("create %s in %s: %w", name, dir.Name(), err)
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
+	_, writeErr := f.Write(contents)
+	// The umask may have narrowed the mode at creation; the workload, which
+	// may run as another user, reads the file.
+	chmodErr := f.Chmod(0o644)
+	if err := errors.Join(writeErr, chmodErr, f.Close()); err != nil {
+		return true, fmt.Errorf("write %s: %w", f.Name(), err)
+	}
+	return true, nil
+}
+
 // maxControlFileBytes bounds what ReadControlFile reads: control files hold a
 // few key=value lines, and the workload, which can write anything there,
 // must not make the agent read a large file.

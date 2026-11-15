@@ -217,8 +217,83 @@ func TestRestoreFailedByAgent(t *testing.T) {
 	}
 }
 
+func TestRestoreClaimRoundTrip(t *testing.T) {
+	for name, tc := range map[string]struct {
+		claim RestoreClaim
+		want  string
+	}{
+		"agent": {
+			claim: RestoreClaim{Owner: ControlFileOwnerAgent, ContainerID: "abc123"},
+			want:  "owner=agent\ncontainer=abc123\n",
+		},
+		"workload": {claim: RestoreClaim{Owner: ControlFileOwnerWorkload}, want: "owner=workload\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := FormatRestoreClaim(tc.claim)
+			if string(data) != tc.want {
+				t.Fatalf("FormatRestoreClaim() = %q, want %q", data, tc.want)
+			}
+			got, err := ParseRestoreClaim(data)
+			if err != nil || got != tc.claim {
+				t.Fatalf("ParseRestoreClaim() = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestParseRestoreClaim(t *testing.T) {
+	t.Run("ignores unknown keys and blank lines", func(t *testing.T) {
+		got, err := ParseRestoreClaim([]byte("since=2026-11-15\n\n owner=workload \n"))
+		if err != nil || got != (RestoreClaim{Owner: ControlFileOwnerWorkload}) {
+			t.Fatalf("ParseRestoreClaim() = %+v, %v", got, err)
+		}
+	})
+
+	// A creator that stopped before writing, or is still writing, leaves a
+	// claim without an owner.
+	for name, data := range map[string]string{
+		"empty":           "",
+		"no owner":        "container=abc123\n",
+		"free text":       "claimed\n",
+		"duplicate owner": "owner=agent\nowner=workload\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := ParseRestoreClaim([]byte(data)); err == nil {
+				t.Fatalf("ParseRestoreClaim(%q) = %+v, want error", data, got)
+			}
+		})
+	}
+}
+
+func TestRestoreClaimHeldByAgentFor(t *testing.T) {
+	agent := RestoreClaim{Owner: ControlFileOwnerAgent, ContainerID: "abc123"}
+	if !agent.HeldByAgentFor("abc123") {
+		t.Fatal("the agent's claim on the same container must be its own")
+	}
+	for name, tc := range map[string]struct {
+		claim     RestoreClaim
+		container string
+	}{
+		"an earlier container":    {claim: agent, container: "def456"},
+		"no container to compare": {claim: RestoreClaim{Owner: ControlFileOwnerAgent}, container: ""},
+		"the workload's claim":    {claim: RestoreClaim{Owner: ControlFileOwnerWorkload}, container: "abc123"},
+		"a workload naming itself": {
+			claim:     RestoreClaim{Owner: ControlFileOwnerWorkload, ContainerID: "abc123"},
+			container: "abc123",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.claim.HeldByAgentFor(tc.container) {
+				t.Fatalf("%+v.HeldByAgentFor(%q) = true, want false", tc.claim, tc.container)
+			}
+		})
+	}
+}
+
 func TestIsReservedControlFile(t *testing.T) {
-	for _, name := range []string{RestoreCompleteFile, RestoreFailedFile, RestoreProxyBinaryName, CUDAJobFileName} {
+	for _, name := range []string{
+		RestoreCompleteFile, RestoreFailedFile, RestoreClaimFile, RestoreProxyBinaryName, CUDAJobFileName,
+	} {
 		if !IsReservedControlFile(name) {
 			t.Errorf("IsReservedControlFile(%q) = false, want true", name)
 		}

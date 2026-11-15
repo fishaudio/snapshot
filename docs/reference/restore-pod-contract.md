@@ -190,11 +190,13 @@ The `nvidia.com/Restored` condition tells these apart. A refusal is
 `RestoreIncompatible`, and a restore whose PodSnapshots were not ready in time
 is `RestoreSnapshotNotReady`. When every destination's own workload had
 written `restore-failed` before the agent began, the restore is
-`RestoreEndedByWorkload`. The agent writes `owner=agent` into the
+`RestoreEndedByWorkload`, and when every destination's workload had claimed
+its container first ([Claiming the container](#claiming-the-container)), it is
+`RestoreClaimedByWorkload`. The agent writes `owner=agent` into the
 `restore-failed` it writes, which is how it tells its own marker from the
 workload's; a workload that writes the file should write anything else. All
-three classify as `Failed` in `podcontract.ClassifyRestoreOutcome`: nothing
-was restored.
+four classify as `Failed` in `podcontract.ClassifyRestoreOutcome`: nothing was
+restored.
 
 The proxy reserves two exit codes:
 
@@ -332,6 +334,52 @@ Without the proxy:
   starts again, it runs the inert command and is not restored. Delete the Pod
   to restore again. A command that starts the workload itself when no restore
   comes can watch for `restore-failed`. When it gives up waiting on its own, it
-  should write `restore-failed` before it starts the workload, so that a
-  restore that becomes possible later stays out of the container.
+  must first claim the container, as below, and then write `restore-failed`
+  before it starts the workload, so that a restore that becomes possible later
+  stays out of the container.
 - The proxy's exit codes, 112 and 113, do not apply.
+
+### Claiming the container
+
+A command that starts the workload itself when no restore comes races the
+agent: if it gives up just as the agent begins the restore, the restore would
+run into a container that already runs the workload, and two copies of it would
+share the container's GPUs. `restore-claim` in the destination's control
+directory settles the race. Whoever creates it first owns the container until
+the Pod is deleted:
+
+- Create it with an exclusive create (`O_CREAT|O_EXCL`, for example
+  `open(path, O_WRONLY|O_CREAT|O_EXCL, 0644)`), then write `owner=workload`
+  into it. Nothing else decides the claim: only whether your create succeeded.
+- Nobody removes, renames or rewrites it. It outlives the container's
+  restarts, since the control directory is the Pod's `emptyDir`. The agent
+  clears `restore-complete` and `restore-failed` before each restore, never
+  `restore-claim`.
+- The agent claims a destination after it has checked for `restore-failed`
+  and before it touches the container or its GPUs for the restore, and before
+  it ends a container with `restore-failed` and a kill. Its claim holds
+  `owner=agent` and the container's runtime ID (`container=<id>`). It restores
+  only into a container whose claim it created, or created before for the
+  same container, after an agent restart.
+- If your create fails because the file exists, and it does not say
+  `owner=workload`, the agent owns the container: do not start the workload.
+  Keep waiting for `restore-complete` or `restore-failed`, with a limit of your
+  own; past it, write `restore-failed` and exit, so the container's restart
+  starts the workload. Treat an empty or unreadable claim the same way: the
+  agent writes its claim's content just after creating it. A claim that says
+  `owner=workload` is yours, from an earlier container of the Pod.
+- If the workload claimed the container first, the agent neither restores
+  into it nor kills it, and writes nothing into it. The restore ends with reason
+  `RestoreClaimedByWorkload` when every destination was claimed that way.
+- A claim the agent made for an earlier container of the Pod, or one it cannot
+  read, keeps the restore out of the container too. The agent then writes
+  `restore-failed`, unless the container holds one, so that what waits there
+  stops waiting, but does not kill the container; the restore is
+  `RestoreFailed`.
+- The restore proxy never claims a container, so with the proxy the agent's
+  claim always succeeds and nothing changes.
+
+The limit on your wait after the agent claimed bounds the restore: once it
+passes, your container exits and takes any restored process with it, and the
+restore fails. Make it longer than a restore takes;
+`config.restore.timeoutSeconds` is the agent's own bound.

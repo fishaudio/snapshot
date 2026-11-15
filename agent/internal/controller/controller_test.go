@@ -52,7 +52,10 @@ type fakeRuntime struct {
 	mu                   sync.Mutex
 	containerIDByPod     string
 	resolvedContainerIDs []string
-	resolveContainerPID  int
+	// resolveContainerPID is the placeholder PID ResolveContainer returns,
+	// defaultPlaceholderPID when zero; unresolvable makes it fail instead.
+	resolveContainerPID int
+	unresolvable        bool
 	// podUID is the Pod's UID on the node, as the runtime reports it.
 	podUID string
 	// sandboxIPs are the IPs of the Pod's sandbox, and sandboxPodUIDs the
@@ -67,11 +70,19 @@ func (r *fakeRuntime) ResolveContainer(_ context.Context, id string) (int, *spec
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.resolvedContainerIDs = append(r.resolvedContainerIDs, id)
+	if r.unresolvable {
+		return 0, nil, errors.New("not implemented")
+	}
 	if r.resolveContainerPID > 0 {
 		return r.resolveContainerPID, &specs.Spec{}, nil
 	}
-	return 0, nil, errors.New("not implemented")
+	// A restore claims its destination through the container's placeholder,
+	// so every restore resolves one.
+	return defaultPlaceholderPID, &specs.Spec{}, nil
 }
+
+// defaultPlaceholderPID is the placeholder a fakeRuntime resolves by default.
+const defaultPlaceholderPID = 4242
 
 func (r *fakeRuntime) ResolveContainerIDByPod(_ context.Context, _, _, _ string) (string, error) {
 	r.mu.Lock()
@@ -156,7 +167,7 @@ func TestNewDefaultControllerSetsDefaultOperations(t *testing.T) {
 		testr.New(t),
 	)
 	t.Cleanup(w.restoreQueue.ShutDown)
-	if w.checkpointFn == nil || w.restoreFn == nil || w.writeControlSentinelFn == nil || w.writePodControlSentinelFn == nil || w.controlSentinelExistsFn == nil || w.readControlFileFn == nil || w.sendSignalFn == nil || w.restoreQueue == nil {
+	if w.checkpointFn == nil || w.restoreFn == nil || w.writeControlSentinelFn == nil || w.writePodControlSentinelFn == nil || w.controlSentinelExistsFn == nil || w.readControlFileFn == nil || w.claimControlFileFn == nil || w.sendSignalFn == nil || w.restoreQueue == nil {
 		t.Fatal("default controller operations must be initialized")
 	}
 	if w.compareFn == nil {
@@ -200,6 +211,7 @@ func makeTestController(t *testing.T, pod *corev1.Pod, apiObjects ...runtime.Obj
 		writePodControlSentinelFn: func(string, string, string, []byte) error { return nil },
 		controlSentinelExistsFn:   func(int, string) (bool, error) { return false, nil },
 		readControlFileFn:         func(int, string) ([]byte, bool, error) { return nil, false, nil },
+		claimControlFileFn:        func(int, string, []byte) (bool, error) { return true, nil },
 		sendSignalFn:              func(logr.Logger, int, syscall.Signal, string) error { return nil },
 		restoreQueue:              workqueue.NewTypedDelayingQueue[client.ObjectKey](),
 		compareFn:                 compat.Compare,
@@ -1954,7 +1966,7 @@ func TestRunRestoreFailureMarksUnresolvedContainerThroughHostPath(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			pod := restorePod(map[string]string{podcontract.RestoreFromAnnotation: "snapshot-a"})
 			w := makeTestController(t, pod)
-			w.runtime = &fakeRuntime{podUID: tc.runtimePodUID} // ResolveContainer fails
+			w.runtime = &fakeRuntime{podUID: tc.runtimePodUID, unresolvable: true}
 			artifact := &restoreArtifact{SnapshotName: "snapshot-a", ContentUID: "content-uid", SourceContainerName: "main"}
 			w.restoreFn = func(context.Context, snapshotruntime.Runtime, logr.Logger, executor.RestoreRequest, executor.RestoreMounter) (executor.RestoreResult, error) {
 				return executor.RestoreResult{}, errors.New("criu restore failed")

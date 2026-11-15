@@ -121,6 +121,31 @@ const (
 	// wrote.
 	ControlFileOwnerAgent = "agent"
 
+	// ControlFileOwnerWorkload is the owner of a control file a destination
+	// container's own command wrote.
+	ControlFileOwnerWorkload = "workload"
+
+	// RestoreClaimFile decides who starts a destination container: the
+	// Snapshot agent, with a restore, or the container's own command, without
+	// one. Whoever creates it first, with an exclusive create (O_CREAT|O_EXCL),
+	// owns the container. Nobody removes or rewrites it, so it outlives the
+	// container's restarts.
+	//
+	// The agent creates it before it touches a destination container or its
+	// GPUs for a restore, and before it ends one with restore-failed and a
+	// kill. It restores only into a container whose claim it created, or one
+	// it created before for the same container, and never kills a container
+	// whose claim it did not create. A command that starts the workload itself
+	// when no restore comes creates it before it does, and starts the workload
+	// only if it created it; otherwise it waits for RestoreCompleteFile or
+	// RestoreFailedFile. The restore proxy never creates it. Its contents are
+	// key=value lines built by FormatRestoreClaim.
+	RestoreClaimFile = "restore-claim"
+
+	// RestoreClaimContainerKey names, in a claim the agent created, the
+	// runtime ID of the container it claimed, without the runtime's scheme.
+	RestoreClaimContainerKey = "container"
+
 	// RestoreCompletePIDKey names the restored process's PID, relative to the
 	// destination container's PID namespace, in RestoreCompleteFile.
 	RestoreCompletePIDKey = "pid"
@@ -140,7 +165,7 @@ const (
 // action must not name one: writing it would act as Snapshot's own signal.
 func IsReservedControlFile(name string) bool {
 	switch name {
-	case RestoreCompleteFile, RestoreFailedFile, RestoreProxyBinaryName, CUDAJobFileName:
+	case RestoreCompleteFile, RestoreFailedFile, RestoreClaimFile, RestoreProxyBinaryName, CUDAJobFileName:
 		return true
 	}
 	return false
@@ -201,6 +226,65 @@ func ParseRestoreComplete(data []byte) (RestoreComplete, error) {
 		return RestoreComplete{}, fmt.Errorf("%s has no %s", RestoreCompleteFile, RestoreCompletePIDKey)
 	}
 	return rc, nil
+}
+
+// RestoreClaim is the content of RestoreClaimFile.
+type RestoreClaim struct {
+	// Owner is ControlFileOwnerAgent or ControlFileOwnerWorkload.
+	Owner string
+	// ContainerID is the runtime ID of the container the agent claimed. A
+	// workload's claim leaves it empty: it is for the container it runs in.
+	ContainerID string
+}
+
+// HeldByAgentFor reports whether the claim is the agent's, for the container
+// with runtime ID containerID.
+func (c RestoreClaim) HeldByAgentFor(containerID string) bool {
+	return c.Owner == ControlFileOwnerAgent && containerID != "" && c.ContainerID == containerID
+}
+
+// FormatRestoreClaim renders the content of RestoreClaimFile.
+func FormatRestoreClaim(c RestoreClaim) []byte {
+	content := ControlFileOwnerKey + "=" + c.Owner + "\n"
+	if c.ContainerID != "" {
+		content += RestoreClaimContainerKey + "=" + c.ContainerID + "\n"
+	}
+	return []byte(content)
+}
+
+// ParseRestoreClaim reads the content of RestoreClaimFile. Unknown keys are
+// ignored so either side can add fields without breaking older readers. A
+// claim without an owner does not parse: its creator may still be writing it,
+// or stopped before it did.
+func ParseRestoreClaim(data []byte) (RestoreClaim, error) {
+	var c RestoreClaim
+	seen := map[string]bool{}
+	for line := range strings.Lines(string(data)) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return RestoreClaim{}, fmt.Errorf("invalid %s line %q: expected key=value", RestoreClaimFile, line)
+		}
+		if key != ControlFileOwnerKey && key != RestoreClaimContainerKey {
+			continue
+		}
+		if seen[key] {
+			return RestoreClaim{}, fmt.Errorf("duplicate %s key %q", RestoreClaimFile, key)
+		}
+		seen[key] = true
+		if key == ControlFileOwnerKey {
+			c.Owner = value
+		} else {
+			c.ContainerID = value
+		}
+	}
+	if c.Owner == "" {
+		return RestoreClaim{}, fmt.Errorf("%s has no %s", RestoreClaimFile, ControlFileOwnerKey)
+	}
+	return c, nil
 }
 
 // FormatAgentRestoreFailed renders what the agent writes into

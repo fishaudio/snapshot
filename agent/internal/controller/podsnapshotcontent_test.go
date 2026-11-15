@@ -872,6 +872,7 @@ func TestRunCheckpoint_WritesFailedOnError(t *testing.T) {
 
 func TestExecutorCheckpointInspectionFailureDoesNotKill(t *testing.T) {
 	w := makeNodeController(t, &fakeCheckpointer{})
+	w.runtime = &fakeRuntime{unresolvable: true}
 	w.config.PageBroker = snapshottypes.PageBrokerSpec{ControlSocketPath: filepath.Join(t.TempDir(), "pagebroker.sock")}
 	ctx, target := startKillableTarget(t)
 	defer func() {

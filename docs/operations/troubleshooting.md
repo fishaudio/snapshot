@@ -61,12 +61,15 @@ kubectl get podsnapshot -n <ns>
 Create restore Pods after their `PodSnapshot`s are Ready, or raise the wait.
 The Pod does not restore later; create a new one.
 
-## A restore ends with `RestoreEndedByWorkload`
+## A restore ends with `RestoreEndedByWorkload` or `RestoreClaimedByWorkload`
 
-Every destination container already held a `restore-failed` that its own
-workload wrote: its command gave up waiting for the restore and started
-without one before the agent began. The agent leaves such a container alone.
-The message names each destination. A workload's wait shorter than the time
+Every destination container's own command gave up waiting for the restore and
+started without one before the agent began: it had already written
+`restore-failed` (`RestoreEndedByWorkload`), or had claimed its container with
+`restore-claim` just before the agent came to claim it
+(`RestoreClaimedByWorkload`). See
+[Claiming the container](../reference/restore-pod-contract.md#claiming-the-container).
+The agent leaves such a container alone. The message names each destination. A workload's wait shorter than the time
 the agent needs to begin, including `config.restore.snapshotWaitSeconds`,
 causes it; make the workload wait longer. When only some destinations ended
 this way, the condition is `RestorePartiallySucceeded` or `RestoreFailed`

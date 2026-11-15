@@ -74,6 +74,7 @@ type NodeController struct {
 	writePodControlSentinelFn func(string, string, string, []byte) error
 	controlSentinelExistsFn   func(int, string) (bool, error)
 	readControlFileFn         func(int, string) ([]byte, bool, error)
+	claimControlFileFn        func(int, string, []byte) (bool, error)
 	sendSignalFn              func(logr.Logger, int, syscall.Signal, string) error
 	// hostProcPath is where the agent reads the node's processes; tests point it elsewhere.
 	hostProcPath         string
@@ -312,6 +313,7 @@ func newDefaultController(
 		writePodControlSentinelFn: snapshotruntime.WritePodControlSentinel,
 		controlSentinelExistsFn:   snapshotruntime.ControlSentinelExists,
 		readControlFileFn:         snapshotruntime.ReadControlFile,
+		claimControlFileFn:        snapshotruntime.ClaimControlFile,
 		sendSignalFn:              snapshotruntime.SendSignalToPID,
 		hostProcPath:              snapshotruntime.HostProcPath,
 		stagingCapacityFn:         snapshotruntime.StagingCapacity,
@@ -1257,11 +1259,13 @@ func (w *NodeController) resolveRestoreContainerID(ctx context.Context, pod *cor
 
 // runRestore runs the full restore workflow for one destination container:
 //  0. Refuse a container that holds restore-failed (refuseEndedDestination):
-//     it was told that no restore is coming.
+//     it was told that no restore is coming. Then claim the container
+//     (claimDestination): one whose workload claimed it first starts without
+//     a restore, and nothing below touches it.
 //  1. Call executor.Restore (inspect placeholder → nsrestore inside namespace).
 //     nsrestore clears any stale restore-complete and restore-failed sentinels
 //     on the pod control volume before CRIU, so a prior incarnation cannot
-//     release the restored process early.
+//     release the restored process early. It leaves the claim.
 //  2. Write a restore-complete sentinel holding the restored PID: the
 //     CRIU-restored process resumes inside the polling loop that waits on
 //     this file, exits quiescence, and resumes the engine. On failure, write
@@ -1286,6 +1290,9 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, plan *
 		}
 	}
 	if err := op.refuseEndedDestination(ctx); err != nil {
+		return err
+	}
+	if err := op.claimDestination(ctx); err != nil {
 		return err
 	}
 

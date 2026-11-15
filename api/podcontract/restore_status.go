@@ -60,6 +60,11 @@ const (
 	// the workload of every destination container had already given up on it
 	// and started without one: each held a restore-failed its workload wrote.
 	RestoreReasonEndedByWorkload = "RestoreEndedByWorkload"
+	// RestoreReasonClaimedByWorkload marks a restore that did not run because
+	// the workload of every destination container claimed its container
+	// first, with restore-claim, to start without a restore. The agent left
+	// those containers alone.
+	RestoreReasonClaimedByWorkload = "RestoreClaimedByWorkload"
 )
 
 // ClassifyRestoreOutcome returns the public restore outcome represented by Pod
@@ -78,7 +83,7 @@ func ClassifyRestoreOutcome(conditions []corev1.PodCondition) RestoreOutcome {
 		}
 		switch condition.Reason {
 		case RestoreReasonFailed, RestoreReasonIncompatible,
-			RestoreReasonSnapshotNotReady, RestoreReasonEndedByWorkload:
+			RestoreReasonSnapshotNotReady, RestoreReasonEndedByWorkload, RestoreReasonClaimedByWorkload:
 			return RestoreOutcomeFailed
 		case RestoreReasonPartiallySucceeded:
 			return RestoreOutcomePartiallySucceeded

@@ -4,9 +4,12 @@
 package runtime
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -183,6 +186,118 @@ func TestControlSentinelExistsWithoutControlDir(t *testing.T) {
 	}
 	if _, err := controlSentinelExists(procRoot, pid, "restore-complete"); err == nil {
 		t.Fatal("expected an error for a missing control mount")
+	}
+}
+
+func TestClaimControlFile(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	path := filepath.Join(controlDir, "restore-claim")
+
+	created, err := claimControlFile(procRoot, pid, "restore-claim", []byte("owner=agent\n"))
+	if err != nil || !created {
+		t.Fatalf("first claim: created %v, err %v", created, err)
+	}
+	if got := readSentinel(t, path); got != "owner=agent\n" {
+		t.Fatalf("claim holds %q", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("claim mode %v, err %v; the workload must be able to read it", info.Mode(), err)
+	}
+
+	// A second claim, by the agent or by the workload, finds the first.
+	created, err = claimControlFile(procRoot, pid, "restore-claim", []byte("owner=other\n"))
+	if err != nil || created {
+		t.Fatalf("second claim: created %v, err %v", created, err)
+	}
+	if _, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("the workload's exclusive create after the agent's: %v", err)
+	}
+	if got := readSentinel(t, path); got != "owner=agent\n" {
+		t.Fatalf("a lost claim changed the claim to %q", got)
+	}
+}
+
+// The workload claims first: the agent's claim finds it and changes nothing.
+func TestClaimControlFileAfterTheWorkload(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	path := filepath.Join(controlDir, "restore-claim")
+	if err := os.WriteFile(path, []byte("owner=workload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := claimControlFile(procRoot, pid, "restore-claim", []byte("owner=agent\n"))
+
+	if err != nil || created {
+		t.Fatalf("created %v, err %v", created, err)
+	}
+	if got := readSentinel(t, path); got != "owner=workload\n" {
+		t.Fatalf("claim holds %q", got)
+	}
+}
+
+// Whatever the workload put under the name is a claim the agent did not make,
+// and is never followed.
+func TestClaimControlFileNeverFollowsWhatIsThere(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Symlink(target, filepath.Join(controlDir, "restore-claim")); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := claimControlFile(procRoot, pid, "restore-claim", []byte("owner=agent\n"))
+
+	if err != nil || created {
+		t.Fatalf("created %v, err %v", created, err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("the claim followed the symlink: %v", err)
+	}
+}
+
+// The agent and the workload race for the claim many times over: each time
+// exactly one of them creates it.
+func TestClaimControlFileHasOneWinner(t *testing.T) {
+	for range 200 {
+		procRoot, pid, controlDir := fakeContainer(t)
+		var agentWon, workloadWon atomic.Int32
+		var racers sync.WaitGroup
+		start := make(chan struct{})
+		for range 4 {
+			racers.Go(func() {
+				<-start
+				if created, err := claimControlFile(procRoot, pid, "restore-claim", []byte("owner=agent\n")); err == nil && created {
+					agentWon.Add(1)
+				}
+			})
+			racers.Go(func() {
+				<-start
+				f, err := os.OpenFile(filepath.Join(controlDir, "restore-claim"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+				if err == nil {
+					workloadWon.Add(1)
+					_ = f.Close()
+				}
+			})
+		}
+		close(start)
+		racers.Wait()
+		if winners := agentWon.Load() + workloadWon.Load(); winners != 1 {
+			t.Fatalf("%d racers created the claim, want 1", winners)
+		}
+	}
+}
+
+func TestClaimControlFileWithoutControlDir(t *testing.T) {
+	procRoot, pid, controlDir := fakeContainer(t)
+	if err := os.Remove(controlDir); err != nil {
+		t.Fatal(err)
+	}
+	created, err := claimControlFile(procRoot, pid, "restore-claim", nil)
+	if err == nil || created {
+		t.Fatalf("created %v, err %v; want an error for a missing control mount", created, err)
+	}
+	if _, err := claimControlFile(procRoot, pid, "../restore-claim", nil); err == nil {
+		t.Fatal("expected an error for a name outside the control directory")
 	}
 }
 

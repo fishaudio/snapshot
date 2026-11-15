@@ -130,10 +130,10 @@ snapshotctl restore \
   readiness, events, and agent logs
 - `RestoreSucceeded` means every destination restored, `RestorePartiallySucceeded`
   means only some restored, and `RestoreFailed` means none restored.
-  `RestoreIncompatible`, `RestoreSnapshotNotReady` and `RestoreEndedByWorkload`
-  also mean none restored: the node could not run the snapshot, the
-  `PodSnapshot`s were not ready in time, or the workloads started without a
-  restore first
+  `RestoreIncompatible`, `RestoreSnapshotNotReady`, `RestoreEndedByWorkload`
+  and `RestoreClaimedByWorkload` also mean none restored: the node could not
+  run the snapshot, the `PodSnapshot`s were not ready in time, or the
+  workloads started without a restore first
 - partial and failed outcomes are terminal; retry them with a new restore Pod
 - `snapshotctl` is useful for debugging and lower-level validation, but it does
   not replace the operator-managed checkpoint flow

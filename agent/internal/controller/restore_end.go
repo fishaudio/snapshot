@@ -155,6 +155,11 @@ func (w *NodeController) runningDestinationContainer(ctx context.Context, pod *c
 // killed. A container that already holds restore-failed or restore-complete
 // was told its outcome before, by an earlier pass, an earlier agent or its
 // own workload, and may be running its workload by now, so it is left alone.
+//
+// The agent claims the container before it ends it, and kills only a
+// container it claimed: one its workload claimed first is starting without a
+// restore. A claim made for an earlier container gets restore-failed, so what
+// waits in this one stops waiting, but no kill.
 func (w *NodeController) endDestination(ctx context.Context, pod *corev1.Pod, destination, containerID string, log logr.Logger) {
 	hostPID, _, err := w.runtime.ResolveContainer(ctx, containerID)
 	if err != nil {
@@ -167,6 +172,19 @@ func (w *NodeController) endDestination(ctx context.Context, pod *corev1.Pod, de
 		log.Error(err, "Cannot tell whether the destination container was already told its restore outcome; ending it")
 	} else if told {
 		log.V(1).Info("Destination container already holds its restore outcome; leaving it alone")
+		return
+	}
+	claim, err := w.claimDestination(hostPID, containerID)
+	switch {
+	case err != nil:
+		log.Error(err, "Cannot claim the destination container to end it; ending it")
+	case claim.heldByWorkload():
+		log.Info("The destination container's workload claimed it first; leaving it to start without a restore")
+		return
+	case !claim.ours:
+		log.Info("The destination container's claim is not this agent's; telling it that no restore is coming, without a kill",
+			"claim", claim.describe())
+		w.tellNoRestoreComing(hostPID, log)
 		return
 	}
 	if err := w.writeControlSentinelFn(hostPID, podcontract.RestoreFailedFile, restoreFailedSentinelContents); err != nil {

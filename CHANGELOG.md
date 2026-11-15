@@ -125,6 +125,18 @@ commit-level history for each release is on its
   matches on `RestoreFailed` to find a restore that did not run should also
   match the new reasons. See
   [Restore Pod contract](docs/reference/restore-pod-contract.md).
+- The agent claims each destination container before it restores into it
+  or ends it, by creating `restore-claim` in the container's control directory
+  with an exclusive create. A command that starts the workload itself when no
+  restore comes, on a node without the restore proxy, can claim the container
+  the same way before it starts: if it claims first, the agent neither
+  restores into the container nor kills it, and the restore ends with the new
+  reason `RestoreClaimedByWorkload`. Without the claim, a restore slower than
+  the workload's own wait ran into a container that was already running the
+  workload. The claim is never removed, so it also keeps the restore out of
+  the container's later starts. Workloads that do not claim, and the restore
+  proxy, are unaffected. `restore-claim` is a reserved control file. See
+  [Claiming the container](docs/reference/restore-pod-contract.md#claiming-the-container).
 - With `config.criu.tcpEstablished`, the default, a restore no longer waits
   for kubelet to publish the restore Pod's IP address, which can take up to a
   second after the Pod starts. While the API has none, the node agent reads it

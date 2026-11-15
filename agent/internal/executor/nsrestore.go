@@ -137,6 +137,26 @@ func RestoreInNamespace(ctx context.Context, opts RestoreOptions, log logr.Logge
 	return result, nil
 }
 
+// clearRestoreOutcome removes the restore-complete and restore-failed
+// sentinels from the control directory at dir, the pod emptyDir mounted at
+// SnapshotControlMountPath, in the restore target's mount namespace. Each
+// attempt then writes them at most once: a leftover restore-complete from an
+// earlier incarnation cannot release the restored process before this
+// CRIU/CUDA attempt finishes. A missing file is already gone; a missing mount
+// is a hard error.
+//
+// It never removes restore-claim. The agent claimed this container before the
+// restore began, and the claim is what keeps the workload from starting
+// without a restore while this one runs.
+func clearRestoreOutcome(dir string) error {
+	for _, name := range []string{podcontract.RestoreCompleteFile, podcontract.RestoreFailedFile} {
+		if err := snapshotruntime.RemoveControlSentinel(dir, name); err != nil {
+			return fmt.Errorf("remove stale %s sentinel: %w", name, err)
+		}
+	}
+	return nil
+}
+
 type nsrestorePhaseTimings struct {
 	overlayCaptureDuration time.Duration
 	criuPrepareDuration    time.Duration
@@ -226,16 +246,8 @@ func executeRestore(
 		coordinatorFdPath = fmt.Sprintf("/proc/self/fd/%d", coordinator.Fd())
 	}
 
-	// The restore-complete and restore-failed sentinels live on the pod
-	// emptyDir mounted at SnapshotControlMountPath. Clear them here, in that
-	// mount namespace, so each attempt writes them at most once: a leftover
-	// restore-complete from an earlier incarnation cannot release the restored
-	// process before this CRIU/CUDA attempt finishes. A missing file is already
-	// gone; a missing mount is a hard error.
-	for _, name := range []string{podcontract.RestoreCompleteFile, podcontract.RestoreFailedFile} {
-		if err := snapshotruntime.RemoveControlSentinel(podcontract.SnapshotControlMountPath, name); err != nil {
-			return nil, 0, nil, failStep(StepRestoreCRIU, fmt.Errorf("remove stale %s sentinel: %w", name, err))
-		}
+	if err := clearRestoreOutcome(podcontract.SnapshotControlMountPath); err != nil {
+		return nil, 0, nil, failStep(StepRestoreCRIU, err)
 	}
 
 	if err := criu.RemoveKdatCache("/"); err != nil {
