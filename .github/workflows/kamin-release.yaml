@@ -1,0 +1,227 @@
+# Fork-only: publishes this fork's agent, operator and PageBroker images and its
+# Helm chart to this repository's GHCR namespace. Upstream's push-artifacts.yaml
+# publishes to ghcr.io/ai-dynamo/snapshot and runs only on main and release
+# branches; its release.yaml runs only for a published GitHub release.
+#
+#   push to kamin/main
+#     <registry>/<image>:<12-char commit>, linux/amd64
+#   tag v<upstream>-kamin.<n> on a kamin/main commit
+#     <registry>/<image>:<tag>, the very images of that commit (built here only
+#     if the branch run left none), and the chart <tag without v> at
+#     oci://<registry>/charts/snapshot, whose image repositories default to
+#     <registry> and whose image tags default to <tag>
+#
+# KAMIN-PATCHES.md lists the fork's patches and how to cut a release.
+name: kamin release
+
+on:
+  push:
+    branches: [kamin/main]
+    tags: ['v*-kamin.*']
+
+permissions: {}
+
+concurrency:
+  group: kamin-release-${{ github.ref }}
+  # A newer push to the branch supersedes the build of an older commit; a
+  # release run is never cut short.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository }}
+  # The criu-dev commit the LZ4 page compression was verified on.
+  CRIU_REF: b64199c850c22a55ce82ac81253dd9bca578acb0
+  # As hack/tools.mk.
+  HELM_VERSION: v3.17.3
+
+jobs:
+  version:
+    name: Resolve the version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      commit-tag: ${{ steps.resolve.outputs.commit-tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # All branches and their history, so that a release can be checked
+      # against kamin/main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve the commit and the release version
+        id: resolve
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Peeled, so an annotated tag names its commit.
+          commit="$(git rev-parse 'HEAD^{commit}')"
+          echo "commit-tag=${commit::12}" | tee -a "$GITHUB_OUTPUT"
+          if [ "${REF_TYPE}" != tag ]; then
+            exit 0
+          fi
+          if ! [[ "${REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-kamin\.[0-9]+$ ]]; then
+            echo "::error::tag ${REF_NAME} is not v<major>.<minor>.<patch>-kamin.<n>"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${commit}" origin/kamin/main; then
+            echo "::error::${REF_NAME} names ${commit}, which is not on kamin/main"
+            exit 1
+          fi
+          echo "version=${REF_NAME}" | tee -a "$GITHUB_OUTPUT"
+
+  images:
+    name: ${{ matrix.image }} image
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [agent, operator, pagebroker]
+    env:
+      IMAGE: ${{ matrix.image }}
+      COMMIT_TAG: ${{ needs.version.outputs.commit-tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # On 2026-11-11 every apt-get in these builds failed to resolve the Ubuntu
+      # archive, through Docker's default resolvers and through the runner's
+      # own: one of ubuntu.com's name servers timed out. The public resolvers
+      # that answered then, Cloudflare's and Quad9's, come first, looked up by
+      # name; the runner's stay as the fallback.
+      - name: Point BuildKit at working resolvers
+        run: |
+          set -euo pipefail
+          ns=""
+          for host in one.one.one.one dns.quad9.net; do
+            ip="$(getent ahostsv4 "${host}" | awk 'NR == 1 {print $1}')" || ip=""
+            if [ -n "${ip}" ]; then
+              ns="${ns}, \"${ip}\""
+            else
+              echo "::warning::could not look up ${host}; BuildKit goes without it"
+            fi
+          done
+          ns="${ns}$(awk '/^nameserver/ {printf ", \"%s\"", $2}' /run/systemd/resolve/resolv.conf)"
+          printf '[dns]\n  nameservers = [%s]\n' "${ns#, }" | tee "${RUNNER_TEMP}/buildkitd.toml"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: ${{ runner.temp }}/buildkitd.toml
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A release tags the image the branch run built from the same commit, so
+      # what was deployed and checked by commit is, digest for digest, what the
+      # version names. --prefer-index=false copies the manifest as it is
+      # instead of wrapping it in an index, which keeps the digest.
+      - name: Tag the commit's image with the version
+        id: promote
+        if: env.VERSION != ''
+        run: |
+          set -euo pipefail
+          src="${REGISTRY}/${IMAGE}:${COMMIT_TAG}"
+          dst="${REGISTRY}/${IMAGE}:${VERSION}"
+          if ! src_digest="$(docker buildx imagetools inspect "${src}" --format '{{.Manifest.Digest}}')"; then
+            echo "::warning::${src} is not published; building ${dst} from source instead"
+            exit 0
+          fi
+          docker buildx imagetools create --prefer-index=false -t "${dst}" "${src}"
+          dst_digest="$(docker buildx imagetools inspect "${dst}" --format '{{.Manifest.Digest}}')"
+          if [ "${dst_digest}" != "${src_digest}" ]; then
+            echo "::error::${dst} is ${dst_digest}, not ${src_digest}"
+            exit 1
+          fi
+          echo "${dst}@${dst_digest} (= ${src})" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "done=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.promote.outputs.done != 'true'
+        run: |
+          set -euo pipefail
+          tag="${VERSION:-${COMMIT_TAG}}"
+          cache="${REGISTRY}/cache:${IMAGE}"
+          make "docker-build-${IMAGE}" \
+            REGISTRY="${REGISTRY}" \
+            TAGS="${tag}" \
+            AGENT_PLATFORM=linux/amd64 \
+            DOCKER_BUILD_ARGS="--push --provenance=false --metadata-file=buildx.json \
+              --build-arg CRIU_REF=${CRIU_REF} \
+              --cache-from type=registry,ref=${cache} \
+              --cache-to type=registry,ref=${cache},mode=max"
+          digest="$(jq -er '."containerimage.digest"' buildx.json)"
+          echo "${REGISTRY}/${IMAGE}:${tag}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Helm chart
+    needs: [version, images]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Package the chart
+        run: |
+          .github/kamin/package-chart.sh "${VERSION}" "${REGISTRY}" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" "${RUNNER_TEMP}/chart"
+
+      - name: Push the chart
+        env:
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${TOKEN}" | helm registry login ghcr.io --username "${ACTOR}" --password-stdin
+          helm push "${RUNNER_TEMP}/chart/snapshot-${VERSION#v}.tgz" "oci://${REGISTRY}/charts" 2>&1 \
+            | tee "${RUNNER_TEMP}/helm-push.log"
+          digest="$(awk '/^Digest: /{print $2}' "${RUNNER_TEMP}/helm-push.log")"
+          case "${digest}" in
+            sha256:*) ;;
+            *) echo "::error::helm push printed no digest"; exit 1 ;;
+          esac
+          echo "oci://${REGISTRY}/charts/snapshot:${VERSION#v}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Read back from the registry: the published chart, not the local file,
+      # must name the release's images.
+      - name: Check the published chart
+        run: |
+          set -euo pipefail
+          helm show chart "oci://${REGISTRY}/charts/snapshot" --version "${VERSION#v}" \
+            | grep -E '^(name|version|appVersion):' | tee "${RUNNER_TEMP}/chart.txt"
+          grep -qx "version: ${VERSION#v}" "${RUNNER_TEMP}/chart.txt"
+          grep -qx "appVersion: ${VERSION}" "${RUNNER_TEMP}/chart.txt"
+          helm template snapshot "oci://${REGISTRY}/charts/snapshot" --version "${VERSION#v}" \
+            | grep -oE "ghcr\.io/[^\" ]+/(agent|operator|pagebroker):[^\" ]+" | sort -u \
+            | tee "${RUNNER_TEMP}/images.txt"
+          printf '%s\n' "${REGISTRY}/agent:${VERSION}" "${REGISTRY}/operator:${VERSION}" \
+            "${REGISTRY}/pagebroker:${VERSION}" | diff - "${RUNNER_TEMP}/images.txt"
