@@ -156,3 +156,14 @@ func (w *NodeController) preflightTargetEnvironment(pod *corev1.Pod, containerNa
 	env.CPUFeatures = w.config.HostCPUFeatures
 	return env
 }
+
+// inputsRefusalLogMessage is what the agent logs when it refuses a restore
+// whose destination container was not started with the snapshot's inputs.
+const inputsRefusalLogMessage = "Refusing restore; the destination container was not started with the snapshot's inputs"
+
+// inputsRefusalMessage puts a sentence around the causes of an inputs
+// refusal, for the condition and the event. The causes name inputs, never
+// their values.
+func inputsRefusalMessage(causes string) string {
+	return "Refused restore; the destination container was not shown to be started with the snapshot's inputs: " + causes
+}

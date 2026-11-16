@@ -136,6 +136,10 @@ type RestoreRequest struct {
 
 	// Decided by the caller, so both gates reach the same answer.
 	SkipCompatCheck bool
+	// Inputs, when set, names the destination container's inputs that must
+	// equal the snapshot's (nvidia.com/restore-match-inputs). They are
+	// compared whether or not SkipCompatCheck is set.
+	Inputs *podcontract.RestoreInputs
 	// WithoutProxy restores into a container whose PID 1 is its own command,
 	// on a node without the restore proxy. Otherwise PID 1 must be the proxy.
 	WithoutProxy bool
@@ -595,6 +599,16 @@ func inspectRestore(
 		if err := checkRestoreProxy(placeholderPID); err != nil {
 			return nil, 0, err
 		}
+	}
+	// The runtime spec holds what the container was started with. The check
+	// runs before anything touches the container or its GPUs, and before
+	// the compatibility checks, which a Pod may skip.
+	if req.Inputs != nil {
+		if err := checkRestoreInputs(req.Inputs, manifest.Inputs, ociSpec, req.WithoutProxy); err != nil {
+			return nil, 0, err
+		}
+		log.V(1).Info("Destination container was started with the snapshot's inputs",
+			"env_variables", len(req.Inputs.Env), "args", req.Inputs.Args)
 	}
 
 	// Read only for the image-digest check, which treats a blank value as

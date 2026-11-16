@@ -75,6 +75,25 @@ causes it; make the workload wait longer. When only some destinations ended
 this way, the condition is `RestorePartiallySucceeded` or `RestoreFailed`
 and lists them with the others.
 
+## A restore ends with `RestoreInputsChanged`
+
+The restore Pod asked, with `nvidia.com/restore-match-inputs`, to restore a
+destination container only if it was started with the snapshot's inputs, and
+the agent could not show that it was. The message says why:
+
+- The named environment variables or the arguments differ from the
+  snapshot's. Usually a Secret or ConfigMap they come from changed after the
+  checkpoint. The container started without a restore, with the current
+  values. Take a new snapshot to restore with them.
+- The snapshot recorded no inputs: an agent older than the check took it.
+  Take a new snapshot.
+- The annotation cannot be read, asks for an input the agent does not know, or
+  names a container that is not a destination. Fix whatever writes it.
+- Arguments cannot be compared because the node runs the restore proxy. Drop
+  `"args": true`, or restore on nodes without the proxy.
+
+See [Restore only with the snapshot's inputs](../reference/restore-pod-contract.md#restore-only-with-the-snapshots-inputs).
+
 ## A checkpoint fails with `InvalidCheckpointReadinessProbe`
 
 The agent refused the container's `checkpointReadinessProbe` before running it,

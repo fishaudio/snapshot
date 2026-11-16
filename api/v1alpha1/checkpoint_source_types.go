@@ -100,4 +100,26 @@ type CheckpointSourcePod struct {
 	// CPU is the container's CPU limit, absent if it had none.
 	// +optional
 	CPU string `json:"cpu,omitempty"`
+
+	// RecordedInputs lists what the checkpoint recorded about how the
+	// container was started, so that a restore Pod can ask, with the
+	// nvidia.com/restore-match-inputs annotation, to be restored only into a
+	// destination container started the same way. Env: its environment
+	// variables. Args: its arguments. The record holds digests, never values.
+	// Absent when nothing was recorded: a restore that asks for the check is
+	// then refused.
+	// +optional
+	// +listType=set
+	RecordedInputs []CheckpointInput `json:"recordedInputs,omitempty"`
 }
+
+// CheckpointInput names one kind of input a checkpoint recorded.
+// +kubebuilder:validation:Enum=Env;Args
+type CheckpointInput string
+
+const (
+	// CheckpointInputEnv is the container's environment variables.
+	CheckpointInputEnv CheckpointInput = "Env"
+	// CheckpointInputArgs is the container's arguments.
+	CheckpointInputArgs CheckpointInput = "Args"
+)

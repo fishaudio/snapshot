@@ -192,10 +192,13 @@ is `RestoreSnapshotNotReady`. When every destination's own workload had
 written `restore-failed` before the agent began, the restore is
 `RestoreEndedByWorkload`, and when every destination's workload had claimed
 its container first ([Claiming the container](#claiming-the-container)), it is
-`RestoreClaimedByWorkload`. The agent writes `owner=agent` into the
+`RestoreClaimedByWorkload`. A restore refused because a destination container
+was not started with the snapshot's inputs is `RestoreInputsChanged`
+([Restore only with the snapshot's inputs](#restore-only-with-the-snapshots-inputs)).
+The agent writes `owner=agent` into the
 `restore-failed` it writes, which is how it tells its own marker from the
 workload's; a workload that writes the file should write anything else. All
-four classify as `Failed` in `podcontract.ClassifyRestoreOutcome`: nothing was
+five classify as `Failed` in `podcontract.ClassifyRestoreOutcome`: nothing was
 restored.
 
 The proxy reserves two exit codes:
@@ -308,6 +311,62 @@ spec:
     - name: router
       image: router:latest
 ```
+
+## Restore only with the snapshot's inputs
+
+Kubernetes resolves a container's environment variables from Secrets and
+ConfigMaps, and expands `$(VAR)` references in its arguments, when the
+container starts. A restored process keeps the values its container was
+started with when the snapshot was taken. If a Secret changes between the
+checkpoint and the start of a restore Pod's container, the container is given
+the new value while the restored process holds the old one.
+
+A restore Pod can ask the agent to restore a destination container only if it
+was started with the same inputs, with the `nvidia.com/restore-match-inputs`
+annotation. Its value is a JSON object keyed by destination container:
+
+```yaml
+metadata:
+  annotations:
+    nvidia.com/restore-from: worker-snapshot
+    nvidia.com/restore-match-inputs: '{"main": {"env": ["DB_PASSWORD", "API_URL"], "args": true}}'
+```
+
+- `env` names environment variables whose values must equal the snapshot's. A
+  variable the snapshot's container did not have must be absent too. List only
+  variables that are the same in every Pod that restores this snapshot: not the
+  Pod's name or IP, `HOSTNAME`, or anything read with the downward API.
+- `args: true` also compares the container's arguments, after Kubernetes
+  expanded them. The restore proxy replaces a container's arguments, so it can
+  be compared only on [nodes without the restore proxy](#nodes-without-the-restore-proxy).
+- An entry names at least one input. The annotation holds names only; never
+  put a value in it.
+
+A checkpoint records, for every snapshot, a salted SHA-256 digest of each of
+the target container's environment variables and of its arguments, in the
+snapshot's own files. The values themselves are already in the snapshot, in the
+memory of the process it saved; the digests are not published anywhere else.
+`status.source.pod.recordedInputs` on the `PodSnapshotContent` lists `Env` and
+`Args` when they were recorded.
+
+After the agent claims a destination container and before it touches it, its
+GPUs, or the snapshot, it compares the digests of the named inputs in the
+container's runtime spec with the recorded ones. It refuses the restore when
+they differ, when the snapshot recorded none (it was taken by an older agent),
+when the record or the annotation cannot be read in full, or when the
+annotation names a container that is not a destination. The refusal ends the
+destination like an incompatible restore: `restore-failed` and a kill, so the
+container starts again at once, without a restore, with the values it is given
+now. The `nvidia.com/Restored` condition is `RestoreInputsChanged`, and its
+message names the inputs, never their values.
+`nvidia.com/snapshot-skip-compat-check` does not skip this check. Destinations
+the annotation does not name are not checked, and a Pod without it restores as
+before. A node agent older than this check ignores the annotation, so upgrade
+the agents before you rely on it.
+
+Files from Secret and ConfigMap volumes are not compared yet: Kubernetes
+mounts their current content, while the restored process may hold what it
+read before the checkpoint.
 
 ## Nodes without the restore proxy
 

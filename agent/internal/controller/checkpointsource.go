@@ -5,6 +5,7 @@ package controller
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 	"github.com/ai-dynamo/snapshot/api/compat"
@@ -44,12 +45,13 @@ func checkpointSourceFromManifest(manifest *types.CheckpointManifest) *snapshotv
 	}
 
 	pod := snapshotv1alpha1.CheckpointSourcePod{
-		Image:       env.Image,
-		ImageDigest: compat.ImageDigest(env.ImageID),
-		Memory:      env.MemoryLimit,
-		CPU:         env.CPULimit,
+		Image:          env.Image,
+		ImageDigest:    compat.ImageDigest(env.ImageID),
+		Memory:         env.MemoryLimit,
+		CPU:            env.CPULimit,
+		RecordedInputs: recordedInputs(manifest.Inputs),
 	}
-	if pod != (snapshotv1alpha1.CheckpointSourcePod{}) {
+	if !sourcePodEmpty(pod) {
 		source.Pod = &pod
 	}
 
@@ -67,4 +69,36 @@ func checkpointSourceFromManifest(manifest *types.CheckpointManifest) *snapshotv
 		return nil
 	}
 	return source
+}
+
+// recordedInputs publishes which inputs the checkpoint recorded, as kinds a
+// restore can ask this agent to compare. A record this agent cannot read
+// publishes none, since a restore that asks to compare it is refused.
+func recordedInputs(inputs *types.InputsManifest) []snapshotv1alpha1.CheckpointInput {
+	if inputs == nil || inputs.Validate() != nil {
+		return nil
+	}
+	var kinds []snapshotv1alpha1.CheckpointInput
+	for _, kind := range []struct {
+		recorded  string
+		published snapshotv1alpha1.CheckpointInput
+	}{
+		{types.InputEnv, snapshotv1alpha1.CheckpointInputEnv},
+		{types.InputArgs, snapshotv1alpha1.CheckpointInputArgs},
+	} {
+		if inputs.Records(kind.recorded) {
+			kinds = append(kinds, kind.published)
+		}
+	}
+	return kinds
+}
+
+// sourcePodEmpty reports whether nothing of the source pod is known, so the
+// block is left out. It looks at every field through reflection rather than
+// a list, so a field added to CheckpointSourcePod is published without
+// touching this; TestSourcePodEmptyCoversEveryField guards that. Every
+// field is optional and leaves an unknown value at its zero value (a nil
+// list included).
+func sourcePodEmpty(pod snapshotv1alpha1.CheckpointSourcePod) bool {
+	return reflect.ValueOf(pod).IsZero()
 }

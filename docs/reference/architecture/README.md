@@ -223,6 +223,14 @@ check name, instead of failing unattributably somewhere inside CRIU.
 `nvidia.com/snapshot-skip-compat-check` bypasses them; it is a debugging escape
 hatch.
 
+A restore Pod can also ask, with `nvidia.com/restore-match-inputs`, that a
+destination container be started with the same environment variables and
+arguments as the checkpointed one. The checkpoint records salted digests of
+them in the snapshot; at **inspect**, before the compatibility checks and
+whether or not they are skipped, the agent compares the destination's runtime
+spec against them and refuses a difference with `RestoreInputsChanged`. See
+[Restore only with the snapshot's inputs](../restore-pod-contract.md#restore-only-with-the-snapshots-inputs).
+
 ## Storage
 
 Every snapshot lives in one store shared by all node agents: by default a

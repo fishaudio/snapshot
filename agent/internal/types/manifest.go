@@ -34,6 +34,10 @@ type CheckpointManifest struct {
 	Host     HostManifest      `yaml:"host,omitempty"`
 	// CuInterpose identifies the libraries verified in the source processes.
 	CuInterpose *CuInterposeManifest `yaml:"cuinterpose,omitempty"`
+	// Inputs records how the checkpointed container was started, as salted
+	// digests, for restores that ask to match it. Nil in a checkpoint taken
+	// before it was recorded.
+	Inputs *InputsManifest `yaml:"inputs,omitempty"`
 }
 
 // ArtifactManifest pins an on-disk checkpoint to the Kubernetes content object

@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -263,4 +264,26 @@ func TestDeferredCommittedCapturePublishesTheSourceItRecorded(t *testing.T) {
 	got := getContent(t, w, content.Name)
 	assert.Nil(t, meta.FindStatusCondition(got.Status.Conditions, snapshotv1alpha1.PodSnapshotConditionFailed))
 	assertPublishedTheRecordedSource(t, got)
+}
+
+// Each field of CheckpointSourcePod, set alone, publishes the block: the
+// emptiness test does not list fields by hand, so a field added later cannot
+// be forgotten there.
+func TestSourcePodEmptyCoversEveryField(t *testing.T) {
+	assert.True(t, sourcePodEmpty(snapshotv1alpha1.CheckpointSourcePod{}))
+	podType := reflect.TypeOf(snapshotv1alpha1.CheckpointSourcePod{})
+	for i := range podType.NumField() {
+		field := podType.Field(i)
+		var pod snapshotv1alpha1.CheckpointSourcePod
+		value := reflect.ValueOf(&pod).Elem().Field(i)
+		switch value.Kind() {
+		case reflect.String:
+			value.SetString("x")
+		case reflect.Slice:
+			value.Set(reflect.MakeSlice(value.Type(), 1, 1))
+		default:
+			t.Fatalf("field %s has kind %s: teach this test to set it", field.Name, value.Kind())
+		}
+		assert.False(t, sourcePodEmpty(pod), "%s alone", field.Name)
+	}
 }

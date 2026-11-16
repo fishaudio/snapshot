@@ -487,6 +487,10 @@ func configureCheckpoint(
 		}
 	}
 	m.CuInterpose = state.CuInterpose
+	// What the container was started with, for restores that ask to be
+	// started the same way. Digests only; a spec without a process records
+	// nothing, and such a restore is then refused.
+	m.Inputs = types.RecordInputs(state.OCISpec)
 
 	if err := types.WriteManifest(checkpointDir, m); err != nil {
 		return nil, nil, fmt.Errorf("failed to write checkpoint manifest: %w", err)

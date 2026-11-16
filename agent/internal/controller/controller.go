@@ -150,6 +150,10 @@ type restorePlan struct {
 	mappings []podcontract.ContainerMapping
 	// Read once in preflight, so both gates reach the same answer.
 	skipCompatCheck bool
+	// inputs holds, by destination container, the inputs that
+	// nvidia.com/restore-match-inputs asks to match the snapshot's. A
+	// destination it does not name is not checked.
+	inputs map[string]podcontract.RestoreInputs
 	// postRestore runs the checkpoint's lifecycle.postRestore action, every
 	// postRestorePeriod until it succeeds; nil without an action. The
 	// preflight already checked it against the destination containers.
@@ -172,6 +176,9 @@ const (
 	restoreResultSucceeded
 	restoreResultFailed
 	restoreResultIncompatible
+	// restoreResultInputsChanged: the destination container was not shown to
+	// be started with the inputs the snapshot recorded, so it was refused.
+	restoreResultInputsChanged
 	// restoreResultDeclined: the destination's workload had already decided
 	// to start without a restore, so the agent left it alone.
 	restoreResultDeclined
@@ -205,10 +212,12 @@ type restoreOperation struct {
 	postRestore       postRestoreHandler
 	postRestorePeriod time.Duration
 	skipCompatCheck   bool
-	destination       string
-	containerID       string
-	startedAt         time.Time
-	log               logr.Logger
+	// inputs names what must match the snapshot's; nil checks nothing.
+	inputs      *podcontract.RestoreInputs
+	destination string
+	containerID string
+	startedAt   time.Time
+	log         logr.Logger
 	// targetPodIP is the restore Pod's IP, which restored TCP connections
 	// move to.
 	targetPodIP string
@@ -639,6 +648,30 @@ func (w *NodeController) reconcileRestorePod(ctx context.Context, pod *corev1.Po
 // bound PodSnapshotContent, and the node-local artifact. Restore execution is
 // entered only when this method returns a complete artifact.
 func (w *NodeController) preflightRestore(ctx context.Context, pod *corev1.Pod) (*restorePlan, error) {
+	// Read first, so a request the agent cannot honour ends the restore
+	// before anything else is read or waited for.
+	inputs, err := podcontract.RestoreInputsFromAnnotations(pod.Annotations)
+	if err != nil {
+		return nil, &executor.RestoreInputsError{Unverifiable: err.Error()}
+	}
+	plan, err := w.preflightRestoreSnapshots(ctx, pod)
+	if err != nil {
+		return nil, err
+	}
+	destinations := make([]string, 0, len(plan.mappings))
+	for _, mapping := range plan.mappings {
+		destinations = append(destinations, mapping.Destination)
+	}
+	if err := podcontract.ValidateRestoreInputsDestinations(inputs, destinations); err != nil {
+		return nil, &executor.RestoreInputsError{Unverifiable: err.Error()}
+	}
+	plan.inputs = inputs
+	return plan, nil
+}
+
+// preflightRestoreSnapshots validates the restore Pod, its referenced
+// PodSnapshots and bound PodSnapshotContents, and the node-local artifacts.
+func (w *NodeController) preflightRestoreSnapshots(ctx context.Context, pod *corev1.Pod) (*restorePlan, error) {
 	if _, mapped := pod.Annotations[podcontract.RestoreFromMapAnnotation]; mapped {
 		return w.preflightRestoreFromMap(ctx, pod)
 	}
@@ -938,6 +971,13 @@ type restoreTally struct {
 	incompatible           []string
 	pending                []string
 	incompatibilityReasons []string
+	// inputsChanged holds the destinations refused because they were not
+	// started with the snapshot's inputs, inputsChangedCauses the cause of
+	// each, and inputsChangedReasons the cause prefixed like
+	// incompatibilityReasons.
+	inputsChanged        []string
+	inputsChangedCauses  []string
+	inputsChangedReasons []string
 	// failureReasons holds "<destination>: <cause>" for each failed destination.
 	failureReasons []string
 	// declined holds the destinations whose workload started without a
@@ -1003,20 +1043,28 @@ func tallyRestoreResults(results []restoreResult) restoreTally {
 			tally.declinedReasons = append(tally.declinedReasons, result.declinedReason)
 		case restoreResultIncompatible:
 			tally.incompatible = append(tally.incompatible, result.destination)
-			reason := result.reason
-			switch {
-			case result.snapshot != "":
-				// The refusal message names no PodSnapshot, so each reason does.
-				reason = fmt.Sprintf("%s: %s", describeSnapshotMappings([]podcontract.SnapshotMapping{
-					{Destination: result.destination, SnapshotName: result.snapshot},
-				}), reason)
-			case len(results) > 1:
-				reason = fmt.Sprintf("%s: %s", result.destination, reason)
-			}
-			tally.incompatibilityReasons = append(tally.incompatibilityReasons, reason)
+			tally.incompatibilityReasons = append(tally.incompatibilityReasons, refusalReason(result, len(results)))
+		case restoreResultInputsChanged:
+			tally.inputsChanged = append(tally.inputsChanged, result.destination)
+			tally.inputsChangedCauses = append(tally.inputsChangedCauses, result.reason)
+			tally.inputsChangedReasons = append(tally.inputsChangedReasons, refusalReason(result, len(results)))
 		}
 	}
 	return tally
+}
+
+// refusalReason names the destination, or its PodSnapshot, before the cause
+// of a refusal when the Pod has more than one: the cause alone names neither.
+func refusalReason(result restoreResult, results int) string {
+	switch {
+	case result.snapshot != "":
+		return fmt.Sprintf("%s: %s", describeSnapshotMappings([]podcontract.SnapshotMapping{
+			{Destination: result.destination, SnapshotName: result.snapshot},
+		}), result.reason)
+	case results > 1:
+		return fmt.Sprintf("%s: %s", result.destination, result.reason)
+	}
+	return result.reason
 }
 
 // logWithStep adds the failing step as a structured key when the error names one.
@@ -1038,7 +1086,7 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 			reason:  podcontract.RestoreReasonInProgress,
 			message: t.progressMessage(snapshotName),
 		}
-	case len(t.failed) == 0 && len(t.incompatible) == 0 && len(t.declined) == 0:
+	case len(t.failed) == 0 && len(t.incompatible) == 0 && len(t.inputsChanged) == 0 && len(t.declined) == 0:
 		return restoreVerdict{
 			status: corev1.ConditionTrue,
 			reason: podcontract.RestoreReasonSucceeded,
@@ -1048,13 +1096,16 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 	case len(t.succeeded) != 0:
 		// Causes can contain commas, so entries are separated by semicolons.
 		notRestored := append(append(append([]string{}, t.failureReasons...), t.incompatible...), t.declineReasons...)
+		for i, destination := range t.inputsChanged {
+			notRestored = append(notRestored, fmt.Sprintf("%s: %s", destination, t.inputsChangedCauses[i]))
+		}
 		return restoreVerdict{
 			status: corev1.ConditionFalse,
 			reason: podcontract.RestoreReasonPartiallySucceeded,
 			message: fmt.Sprintf("Restored %d of %d destination containers from %s; not restored: %s",
 				len(t.succeeded), t.total, from, strings.Join(notRestored, "; ")),
 		}
-	case len(t.failed) == 0 && len(t.incompatible) == 0:
+	case len(t.failed) == 0 && len(t.incompatible) == 0 && len(t.inputsChanged) == 0:
 		// Every workload started without the restore first. That says nothing
 		// about the snapshot, so it is not a failure of the restore.
 		return restoreVerdict{
@@ -1063,11 +1114,25 @@ func (t restoreTally) verdict(snapshotName string) restoreVerdict {
 			message: fmt.Sprintf("Restore from %s did not run: the workload of %d destination container(s) started without a restore first: %s",
 				from, len(t.declined), strings.Join(t.declineReasons, "; ")),
 		}
-	case len(t.failed) == 0:
+	case len(t.failed) == 0 && len(t.incompatible) != 0:
 		return restoreVerdict{
 			status:  corev1.ConditionFalse,
 			reason:  podcontract.RestoreReasonIncompatible,
-			message: refusalMessage(strings.Join(t.incompatibilityReasons, "; ")) + t.alsoDeclined(),
+			message: refusalMessage(strings.Join(t.incompatibilityReasons, "; ")) + t.alsoInputsChanged() + t.alsoDeclined(),
+		}
+	case len(t.failed) == 0:
+		return restoreVerdict{
+			status:  corev1.ConditionFalse,
+			reason:  podcontract.RestoreReasonInputsChanged,
+			message: inputsRefusalMessage(strings.Join(t.inputsChangedReasons, "; ")) + t.alsoDeclined(),
+		}
+	case len(t.inputsChanged) != 0:
+		return restoreVerdict{
+			status: corev1.ConditionFalse,
+			reason: podcontract.RestoreReasonFailed,
+			message: fmt.Sprintf("Restore failed for %d destination container(s) and refused %d other destination(s) from %s: %s",
+				len(t.failed), len(t.incompatible)+len(t.inputsChanged), from, strings.Join(t.failureReasons, "; ")) +
+				t.alsoInputsChanged() + t.alsoDeclined(),
 		}
 	case len(t.incompatible) != 0:
 		return restoreVerdict{
@@ -1107,6 +1172,21 @@ func (t restoreTally) declinedReason() string {
 	return reason
 }
 
+// alsoInputsChanged names, after a failure or another refusal, the
+// destinations refused because they were not started with the snapshot's
+// inputs. It is empty when there are none.
+func (t restoreTally) alsoInputsChanged() string {
+	if len(t.inputsChanged) == 0 {
+		return ""
+	}
+	causes := make([]string, 0, len(t.inputsChanged))
+	for i, destination := range t.inputsChanged {
+		causes = append(causes, fmt.Sprintf("%s: %s", destination, t.inputsChangedCauses[i]))
+	}
+	return fmt.Sprintf("; %d destination container(s) refused because they were not started with the snapshot's inputs: %s",
+		len(t.inputsChanged), strings.Join(causes, "; "))
+}
+
 // alsoDeclined names, after a failure or refusal, the destinations whose
 // workload started without a restore. It is empty when there are none.
 func (t restoreTally) alsoDeclined() string {
@@ -1124,6 +1204,9 @@ func (t restoreTally) progressMessage(snapshotName string) string {
 	}
 	if len(t.incompatible) != 0 {
 		counts = append(counts, fmt.Sprintf("%d incompatible", len(t.incompatible)))
+	}
+	if len(t.inputsChanged) != 0 {
+		counts = append(counts, fmt.Sprintf("%d refused for changed inputs", len(t.inputsChanged)))
 	}
 	if len(t.declined) != 0 {
 		counts = append(counts, fmt.Sprintf("%d started without a restore", len(t.declined)))
@@ -1181,6 +1264,13 @@ func (w *NodeController) restoreDestination(
 			result.state = restoreResultIncompatible
 			result.reason = compat.Reasons(incompatible.Mismatches)
 			w.logRestoreRefusal(pod, incompatible, result.reason)
+			return result
+		}
+		var inputsChanged *executor.RestoreInputsError
+		if errors.As(err, &inputsChanged) {
+			result.state = restoreResultInputsChanged
+			result.reason = inputsChanged.Error()
+			log.Info(inputsRefusalLogMessage, "reason", result.reason)
 			return result
 		}
 		var declined *restoreDeclinedError
@@ -1314,6 +1404,14 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, plan *
 			w.endDestination(ctx, pod, destination, containerID, op.log)
 			return incompatible
 		}
+		var inputsChanged *executor.RestoreInputsError
+		if errors.As(err, &inputsChanged) {
+			// Refused like an incompatible restore, before the placeholder
+			// or its GPUs were touched: the container starts again at once,
+			// without a restore, with the inputs it is given now.
+			w.endDestination(ctx, pod, destination, containerID, op.log)
+			return inputsChanged
+		}
 
 		var cleanupErr *executor.RestoreCleanupError
 		if !errors.As(err, &cleanupErr) {
@@ -1396,6 +1494,10 @@ func (w *NodeController) newRestoreOperation(
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	source := plan.sourceFor(destination)
 	artifact := source.artifact
+	var inputs *podcontract.RestoreInputs
+	if want, ok := plan.inputs[destination]; ok {
+		inputs = &want
+	}
 	return &restoreOperation{
 		controller:        w,
 		pod:               pod,
@@ -1403,6 +1505,7 @@ func (w *NodeController) newRestoreOperation(
 		postRestore:       source.postRestore,
 		postRestorePeriod: source.postRestorePeriod,
 		skipCompatCheck:   plan.skipCompatCheck,
+		inputs:            inputs,
 		destination:       destination,
 		containerID:       containerID,
 		startedAt:         startedAt,
@@ -1425,6 +1528,7 @@ func (op *restoreOperation) executeRestore(ctx context.Context) (executor.Restor
 		ArtifactContainerName:       op.artifact.SourceContainerName,
 		DestinationContainerName:    op.destination,
 		SkipCompatCheck:             op.skipCompatCheck,
+		Inputs:                      op.inputs,
 		WithoutProxy:                w.withoutProxy,
 		Clientset:                   w.clientset,
 		CustomStorageAvailable:      w.config.CustomStorageAvailable,
@@ -1626,6 +1730,12 @@ func (w *NodeController) handleRestorePreflightError(ctx context.Context, pod *c
 	var incompatible *compat.IncompatibleError
 	if errors.As(cause, &incompatible) {
 		return w.refuseRestore(ctx, pod, incompatible, restoreSourceOf(cause))
+	}
+	var inputsChanged *executor.RestoreInputsError
+	if errors.As(cause, &inputsChanged) {
+		w.log.Info(inputsRefusalLogMessage, "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), "reason", inputsChanged.Error())
+		return w.endRestore(ctx, pod, w.endableDestinations(ctx, pod),
+			podcontract.RestoreReasonInputsChanged, inputsRefusalMessage(inputsChanged.Error()))
 	}
 
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)

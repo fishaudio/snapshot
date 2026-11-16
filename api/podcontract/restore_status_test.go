@@ -36,6 +36,11 @@ func TestClassifyRestoreOutcome(t *testing.T) {
 			want:       RestoreOutcomeUnknown,
 		},
 		{
+			name:       "inputs changed",
+			conditions: []corev1.PodCondition{restored(corev1.ConditionFalse, RestoreReasonInputsChanged)},
+			want:       RestoreOutcomeFailed,
+		},
+		{
 			name:       "incompatible",
 			conditions: []corev1.PodCondition{restored(corev1.ConditionFalse, RestoreReasonIncompatible)},
 			want:       RestoreOutcomeFailed,

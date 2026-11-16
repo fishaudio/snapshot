@@ -42,6 +42,20 @@ commit-level history for each release is on its
   annotation from its manifest. Existing restore Pods are unchanged; upgrade the
   node agent before creating such Pods. See
   [Restore from several PodSnapshots](docs/reference/restore-pod-contract.md#restore-from-several-podsnapshots).
+- A restore Pod can ask, with the `nvidia.com/restore-match-inputs`
+  annotation, to restore a destination container only if its named
+  environment variables, and optionally its arguments, equal the snapshot's.
+  Kubernetes resolves them from Secrets and ConfigMaps when the container
+  starts, while a restored process keeps the values it was checkpointed with.
+  A checkpoint now records salted digests of the target container's
+  environment variables and arguments in the snapshot, and
+  `PodSnapshotContent.status.source.pod.recordedInputs` lists what it recorded.
+  A difference, a snapshot without a record, or an annotation the agent cannot
+  read refuses the restore with the new reason `RestoreInputsChanged`, which
+  classifies as `Failed`, and the containers start without it. CRD change;
+  Pods without the annotation are unchanged. Upgrade the node agents before
+  creating such Pods: an older agent ignores the annotation. See
+  [Restore only with the snapshot's inputs](docs/reference/restore-pod-contract.md#restore-only-with-the-snapshots-inputs).
 - `config.criu.compress` stores memory pages LZ4-compressed when a snapshot is
   taken, and `config.criu.decompressThreads` restores compressed and all-zero
   pages on several workers. Both are off by default. The agent image now builds

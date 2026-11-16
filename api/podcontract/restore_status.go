@@ -65,6 +65,12 @@ const (
 	// first, with restore-claim, to start without a restore. The agent left
 	// those containers alone.
 	RestoreReasonClaimedByWorkload = "RestoreClaimedByWorkload"
+	// RestoreReasonInputsChanged marks a restore refused, with no destination
+	// restored, because a destination container was not started with the
+	// inputs that RestoreMatchInputsAnnotation asked to match: they differ
+	// from the snapshot's, the snapshot recorded none, or the request could
+	// not be read. Nothing about the snapshot or the node failed.
+	RestoreReasonInputsChanged = "RestoreInputsChanged"
 )
 
 // ClassifyRestoreOutcome returns the public restore outcome represented by Pod
@@ -83,7 +89,8 @@ func ClassifyRestoreOutcome(conditions []corev1.PodCondition) RestoreOutcome {
 		}
 		switch condition.Reason {
 		case RestoreReasonFailed, RestoreReasonIncompatible,
-			RestoreReasonSnapshotNotReady, RestoreReasonEndedByWorkload, RestoreReasonClaimedByWorkload:
+			RestoreReasonSnapshotNotReady, RestoreReasonEndedByWorkload, RestoreReasonClaimedByWorkload,
+			RestoreReasonInputsChanged:
 			return RestoreOutcomeFailed
 		case RestoreReasonPartiallySucceeded:
 			return RestoreOutcomePartiallySucceeded
