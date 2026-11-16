@@ -429,6 +429,9 @@ rebuilt).
   `runtime/claim_workload_test.go` races the agent's claim against a real
   workload entrypoint for 300 rounds, at random moments around its deadline;
   it runs only with `KAMIN_ENTRYPOINT_BIN` set to the binary.
+  `controller/restore_claim_race_test.go` (build tag `kamin_claim_race`) runs
+  the agent's whole restore path against the real entrypoint; see "Joint race
+  test with the entrypoint" below.
 - **Upstream**: not covered; nothing upstream lets a workload and the agent
   agree on who starts a destination container. Collisions:
   [#884](https://github.com/ai-dynamo/snapshot/pull/884) (SNEP-883, restore on
@@ -524,15 +527,13 @@ against it.
   `restore-failed` or `restore-complete` when it starts may start without
   claiming: the agent refuses `restore-failed` before it claims, and the claim
   left by the restore that wrote `restore-complete` keeps it out. If the
-  create fails other than `EEXIST`, the entrypoint (`69f6169`) starts without
-  a restore on `ENOSPC`, `EDQUOT` and `EROFS`, reasoning that the agent cannot
-  claim in the same directory either, and exits 2 on anything else, such as
-  `EACCES`. **Open risk**: that reasoning holds for `EROFS`, but not always for
-  `ENOSPC`/`EDQUOT`: on ext4 the blocks reserved for root, and quotas that
-  exempt root, still let the agent, which runs as root, create its claim when
-  a workload running as another user cannot. The agent would then restore into
-  a container that is starting without one. Until that is settled, a workload
-  that is not root should treat `ENOSPC`/`EDQUOT` like `EACCES`.
+  create fails other than `EEXIST`, the entrypoint starts without a restore
+  only on `EROFS`: nobody, root included, can create the claim on a read-only
+  filesystem, so no restore can follow. On anything else, `ENOSPC`, `EDQUOT`
+  and `EACCES` included, it does not start and exits 2: the agent runs as
+  root, and ext4's blocks reserved for root and quotas that exempt root may
+  still let it claim where the workload cannot. (The entrypoint's `8b1b2e8`
+  settled this; the earlier `69f6169` also started on `ENOSPC` and `EDQUOT`.)
 - **Why the agent writes `restore-failed` for a claim that is neither its own
   nor the workload's**: the workload reads such a claim as the agent's and
   waits for its outcome, and the restore proxy waits with no limit. The agent
@@ -565,6 +566,64 @@ against it.
   `restore-failed`. The workload exits anyway, so no two engines; its next
   container finds the agent's claim without an outcome and waits again until
   the agent's failed restore writes `restore-failed`, or exits 114 once more.
+
+### Joint race test with the entrypoint
+
+`agent/internal/controller/restore_claim_race_test.go` runs this agent's
+restore path against the real Kamin entrypoint (`kamin-entrypoint run`,
+restore mode), the workload half of the claim. It is opt in: build tag
+`kamin_claim_race`, Linux only, `KAMIN_ENTRYPOINT_BIN` naming the binary.
+
+- **What is real**: the entrypoint, waiting in a destination container with
+  the container's control directory; the agent's `runRestore` and
+  `endDestination` with their claim, read, sentinel and kill operations
+  (`ClaimControlFile` and the rest, reaching the directory through
+  `<proc>/<pid>/root` of the entrypoint's process, as through `/host/proc` on
+  a node; the build tag adds variants that take the proc root); container
+  restarts, which start the entrypoint again on the same directory with a new
+  process and runtime ID. Run as root, the entrypoint and the workload run as
+  user 65532 on a world-writable control directory, as a non-root workload
+  does on an emptyDir.
+- **What stands in**: the restore itself (it enters the container, takes as
+  long as the test says, clears `restore-complete`/`restore-failed` as
+  `nsrestore` does, and starts a process for the restored workload; it fails
+  if the container ended meanwhile), the container runtime (a container
+  resolves to its entrypoint while that runs), the API server (the fake
+  clients of the other controller tests), and the PID namespace (when a
+  container's entrypoint exits, the test kills the processes in it). The
+  restored process is not the entrypoint's child, so the entrypoint follows it
+  through `/proc` and exits 111 when it goes, where in a container it would
+  exit with the workload's status.
+- **Cases**: the agent first; the workload first; both at once (81 claim
+  moments, 250 µs apart, around the end of the entrypoint's wait; each side
+  must win at least once); the entrypoint restarted before any claim, during
+  the agent's claimed restore, and after a restore, with an agent restart that
+  comes back to the Pod; an agent restart during its own restore (the new
+  agent finds its claim for the same container and restores); a claimed
+  restore that does not finish (the entrypoint exits 114 after two restore
+  timeouts and the next start starts the workload) or finishes during the
+  second wait; the agent ending a restore whose snapshot never became ready.
+  After each: no container both had a restore enter it and started its
+  workload, and the agent killed only containers whose claim was its own.
+- **Run**: from `agent/`,
+  `KAMIN_ENTRYPOINT_BIN=<path>/kamin-entrypoint go test -count=1 -tags kamin_claim_race -run ClaimRace ./internal/controller/`
+  (about 20 s; add `-race` for the data race detector, about 100 s).
+  `KAMIN_CLAIM_RACE_DIR` puts the test's directories on a given filesystem.
+- **On a GPU node** (Kamin's Z0 smoke test): build a static test binary,
+  `CGO_ENABLED=0 go test -c -tags kamin_claim_race -o claim-race.test ./internal/controller/`
+  from `agent/`, and take `/kamin-entrypoint` out of the exact entrypoint
+  image the restore Pods use (`docker create <image>@<digest> /kamin-entrypoint`,
+  then `docker cp`). Run a Pod on the GPU node itself (`nodeName`), with the
+  runtime class of the restore Pods, no GPU request, `runAsUser: 0` (the test
+  drops the entrypoint to user 65532), an image with `tar` for `kubectl cp`,
+  and an emptyDir mounted at `/race` on the same medium as the restore Pods'
+  `snapshot-control` volume. Copy both binaries to `/race`, then run
+  `KAMIN_ENTRYPOINT_BIN=/race/kamin-entrypoint KAMIN_CLAIM_RACE_DIR=/race /race/claim-race.test -test.run ClaimRace -test.count 3 -test.v`.
+  Record the node's kernel, the filesystem (`stat -f -c %T /race`), the
+  entrypoint's version and digest, and the result. The live half of Z0, a
+  real restore slower than `KAMIN_RESTORE_TIMEOUT`, then checks what this test
+  stands in for: CRIU into the container's namespaces and the restored
+  process ending with the container.
 
 ## How far upstream has moved
 
