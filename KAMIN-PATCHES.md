@@ -3,12 +3,12 @@
 `kamin/main` is upstream [ai-dynamo/snapshot](https://github.com/ai-dynamo/snapshot)
 `v0.3.0` plus patches 1–6 below, one commit each, in this order, then one
 `ci(kamin)` commit (`.github/workflows/kamin-release.yaml`,
-`.github/kamin/package-chart.sh`) and this file. Patches 7 and 8 follow, one
-commit each, on the branch `kamin/restore-claim` until they are merged into
+`.github/kamin/package-chart.sh`) and this file, then patches 7 and 8 (with
+patch 8's joint race test). Patch 9 follows on the branch `kamin/restore-inputs` until it is merged into
 `kamin/main`. Nothing else differs from upstream. Every patch is meant to go
 upstream; the fork exists until they are merged there.
 
-Status as of 2026-11-15.
+Status as of 2026-11-16.
 
 | # | Commit | Change | Upstream |
 |---|--------|--------|----------|
@@ -19,7 +19,8 @@ Status as of 2026-11-15.
 | 5 | `efa13477` | capture a Pod's containers one after the other | not covered |
 | 6 | `dfcf8c2e` | end a restore that will not run (refusal, `config.restore.snapshotWaitSeconds`) | not covered; overlaps open designs #800 (SNEP-322), #836 (SNEP-247) |
 | 7 | `3038962f` | own condition reasons for restores that did not run (`RestoreSnapshotNotReady`, `RestoreEndedByWorkload`) | not covered; reasons may collide with the restore-retry stack (#899, #902) |
-| 8 | `41161579`, `df4f9e29` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
+| 8 | `41161579`, `df4f9e29`, `7b37a543` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
+| 9 | `0ff9210b` | restore only into a container started with the snapshot's inputs (`nvidia.com/restore-match-inputs`, `RestoreInputsChanged`) | not covered; reason may collide with the restore-retry stack (#899, #902) |
 
 None of the patches has an upstream issue or pull request yet.
 
@@ -625,6 +626,102 @@ restore mode), the workload half of the claim. It is opt in: build tag
   stands in for: CRIU into the container's namespaces and the restored
   process ending with the container.
 
+## 9. Restore only into a container started with the snapshot's inputs
+
+Commit `0ff9210b` `feat(agent): restore only into a container started with the snapshot's inputs`.
+
+- **What**: a checkpoint records a salted SHA-256 digest of every environment
+  variable of the target container's runtime spec and of its arguments, in
+  the manifest (`inputs`, below), and lists what it recorded in
+  `PodSnapshotContent.status.source.pod.recordedInputs` (`Env`, `Args`). A
+  restore Pod's `nvidia.com/restore-match-inputs` annotation, a JSON object
+  keyed by destination container, names the variables (`env`) and whether the
+  arguments (`args`) must equal the snapshot's. The agent compares them in
+  `inspectRestore`, after it claims the destination (patch 8) and before
+  anything else inspects or touches it. A difference, a snapshot without a
+  record, a record of another version, an annotation it cannot read in full
+  (unknown keys, duplicate keys, an entry that names nothing, a container that
+  is not a destination), or `args` on a node with the restore proxy refuse the
+  restore: the destination is ended like an incompatible one (`restore-failed`,
+  kill) and the Pod's reason is `RestoreInputsChanged`, which classifies as
+  `Failed`. Messages, events and logs name inputs, never values or digests.
+  `nvidia.com/snapshot-skip-compat-check` does not skip it. A Pod without the
+  annotation is restored as before.
+- **Why**: Kubernetes resolves environment variables from Secrets and
+  ConfigMaps, and expands `$(VAR)` in arguments, when the container starts,
+  which can be minutes after the Pod was created (scheduling, image pulls). A
+  restored process keeps the values it was checkpointed with. A Secret changed
+  between the checkpoint, or the moment whoever created the Pod chose the
+  snapshot, and the container's start gives the container the new value while
+  the restored process runs with the old one. Only the node agent sees both
+  what the container was started with (its runtime spec) and what the
+  checkpointed container was started with, and only it runs before the
+  restored process does. Kamin's webhook writes the annotation; it lists the
+  variables that come from Secrets and ConfigMaps (and those built from them
+  with `$(VAR)`), never the per-Pod ones.
+- **The manifest record** (`agent/internal/types/inputs.go`):
+
+  ```yaml
+  inputs:
+    version: 1              # the digest construction; another version is refused
+    recorded: [env, args]   # kinds recorded; a later kind (files) is added here
+    salt: <64 hex>          # 32 random bytes per checkpoint
+    env: {<NAME>: <64 hex>} # every variable the container had
+    args: <64 hex>
+  ```
+
+  Digest, version 1: SHA-256 of `snapshot-restore-inputs/v1\n`, the salt, then
+  the kind, the name and each value, each prefixed with its length as a
+  big-endian u64, the values preceded by their count. An environment
+  variable's values are its whole `NAME=VALUE` entries in the runtime spec, in
+  order; the arguments' name is empty. A variable absent from `env` was not
+  set. Files from Secret and ConfigMap volumes are not recorded yet; they would
+  be a new kind in `recorded`, not a new version.
+- **Security**: the values are in the snapshot already (the environment block
+  is in the saved process's memory), so digests beside them disclose nothing
+  to whoever can read the artifact. They are not copied into any Kubernetes
+  object, and the salt keeps equal values in two snapshots from having equal
+  digests.
+- **Files**: `api/podcontract/{restore_inputs,restore_status}.go`,
+  `api/v1alpha1/checkpoint_source_types.go` (and the generated deepcopy and
+  both CRD copies), `agent/internal/types/{inputs,manifest}.go`,
+  `agent/internal/executor/{inputs,restore,checkpoint}.go`,
+  `agent/internal/controller/{controller,compat,checkpointsource}.go`, docs
+  (`restore-pod-contract.md` section "Restore only with the snapshot's
+  inputs", `api.md`, `troubleshooting.md`, architecture overview, snapshotctl
+  README), `CHANGELOG.md`.
+- **Tests**: `podcontract/restore_inputs_test.go` (every malformed form:
+  not JSON, null, arrays, trailing values, unknown and case-shifted keys,
+  duplicate keys at both levels, entries that name nothing, invalid names,
+  the size limit; destinations), `types/inputs_test.go` (record, salt per
+  record, every way of setting a variable gets its own digest, validation,
+  manifest round trip without the values, an old manifest reads as not
+  recorded), `executor/inputs_test.go` (equal, changed, set on one side only,
+  empty against set, duplicates, arguments, the restore proxy, no or
+  unreadable record; the check runs before `nvidia-smi` and with compatibility
+  checks skipped; a whole `Restore` refused for its inputs mounts nothing and
+  no value or digest reaches the error or any log line at verbosity 10;
+  `configureCheckpoint` records the inputs), `controller/restore_inputs_test.go`
+  (through the real executor: claimed, ended with `restore-failed` and a kill,
+  `RestoreInputsChanged`, one event, no value, salt or digest in the condition,
+  events or logs; a snapshot without a record; a malformed annotation and a
+  non-destination end the restore in preflight; each destination checks its
+  own entry; no annotation, no check; the verdict beside every other outcome;
+  `recordedInputs` published only for a readable record),
+  `controller/checkpointsource_test.go` (each field of
+  `CheckpointSourcePod`, set alone, publishes the block: the emptiness test
+  goes through reflection, not a list of fields).
+- **Upstream**: not covered. The annotation and the record are opt-in and
+  additive, and upstream restore Pods built by `podcontract.Build` copy the
+  source's environment, so they have the same hazard. The new reason would
+  join patch 7's and may collide with the restore-retry stack (#899, #902).
+- **Against upstream main**: builds on patches 6 to 8 (`endDestination`, the
+  claim, the reasons). Applies on top of them; `inspectRestore` and the
+  manifest are unchanged on upstream main.
+- **Status**: fork only. Kamin writes the annotation from its webhook; roll the
+  agent out before the webhook, since an agent without this patch ignores the
+  annotation and restores without the check.
+
 ## How far upstream has moved
 
 As of 2026-11-15 upstream main is at `94b6fa2a` (2026-11-13). `v0.3.0` is on
@@ -677,6 +774,9 @@ the related designs settle.
    build on. Patch 7 can go with patch 6's issue. Patch 8 is a new contract
    between the agent and the workload; raise it on SNEP-322 (#800), and
    settle how it fits SNEP-883 (#884) and SNEP-247 (#836) first.
+8. **Patch 9** (restore inputs): after patches 6 to 8. A new annotation, a new
+   manifest section, a status field and a reason; open an enhancement issue
+   with the Secret-rotation case first.
 
 ## Contributing upstream
 
