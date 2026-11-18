@@ -4,25 +4,36 @@
 `v0.3.0` plus patches 1–6 below, one commit each, in this order, then one
 `ci(kamin)` commit (`.github/workflows/kamin-release.yaml`,
 `.github/kamin/package-chart.sh`) and this file, then patches 7 and 8 (with
-patch 8's joint race test). Patch 9 follows on the branch `kamin/restore-inputs` until it is merged into
-`kamin/main`. Nothing else differs from upstream. Every patch is meant to go
+patch 8's joint race test), then patch 9. Nothing else differs from upstream. Every patch is meant to go
 upstream; the fork exists until they are merged there.
 
-Status as of 2026-11-16.
+Status as of 2026-11-18.
 
 | # | Commit | Change | Upstream |
 |---|--------|--------|----------|
-| 1 | `c297601a` | restore one Pod's containers from several PodSnapshots (`nvidia.com/restore-from-map`) | not covered; overlaps the open pod-group API design (#612, #811) |
-| 2 | `81d92cfb` | take the restore Pod's IP from its CRI sandbox before kubelet publishes it | not covered |
-| 3 | `c832346a` | CRIU LZ4 memory page compression and parallel decoding | not covered; complements #573 |
-| 4 | `cd86f4d3` | chart value `daemonset.restoreProxy.enabled` | not covered; naming at risk from #893 |
-| 5 | `efa13477` | capture a Pod's containers one after the other | not covered |
-| 6 | `dfcf8c2e` | end a restore that will not run (refusal, `config.restore.snapshotWaitSeconds`) | not covered; overlaps open designs #800 (SNEP-322), #836 (SNEP-247) |
+| 1 | `c297601a` | restore one Pod's containers from several PodSnapshots (`nvidia.com/restore-from-map`) | not covered; overlaps the open pod-group API design (#612, #811); design issue [#942](https://github.com/ai-dynamo/snapshot/issues/942) |
+| 2 | `81d92cfb` | take the restore Pod's IP from its CRI sandbox before kubelet publishes it | not covered; issue [#936](https://github.com/ai-dynamo/snapshot/issues/936), `approved` |
+| 3 | `c832346a` | CRIU LZ4 memory page compression and parallel decoding | not covered; complements #573; issue [#938](https://github.com/ai-dynamo/snapshot/issues/938) |
+| 4 | `cd86f4d3` | chart value `daemonset.restoreProxy.enabled` | not covered; naming at risk from #893; issue [#937](https://github.com/ai-dynamo/snapshot/issues/937) |
+| 5 | `efa13477` | capture a Pod's containers one after the other | not covered; issue [#935](https://github.com/ai-dynamo/snapshot/issues/935) |
+| 6 | `dfcf8c2e` | end a restore that will not run (refusal, `config.restore.snapshotWaitSeconds`) | not covered; overlaps open designs #800 (SNEP-322), #836 (SNEP-247); issue [#941](https://github.com/ai-dynamo/snapshot/issues/941) |
 | 7 | `3038962f` | own condition reasons for restores that did not run (`RestoreSnapshotNotReady`, `RestoreEndedByWorkload`) | not covered; reasons may collide with the restore-retry stack (#899, #902) |
 | 8 | `41161579`, `df4f9e29`, `7b37a543` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
 | 9 | `0ff9210b` | restore only into a container started with the snapshot's inputs (`nvidia.com/restore-match-inputs`, `RestoreInputsChanged`) | not covered; reason may collide with the restore-retry stack (#899, #902) |
 
-None of the patches has an upstream issue or pull request yet.
+Patches 1 to 6 each have an upstream issue, opened by the fork's maintainer on
+2026-11-15 and 2026-11-16; patches 7 to 9 have none yet. No patch has an
+upstream pull request yet: upstream takes a pull request only for an issue
+labelled `approved` (see "Contributing upstream"). The issues as of 2026-11-18:
+
+| Patch | Issue | State |
+|---|---|---|
+| 1 | [#942](https://github.com/ai-dynamo/snapshot/issues/942) (design: restore one Pod's containers from several PodSnapshots) | open, not labelled; a SNEP is expected |
+| 2 | [#936](https://github.com/ai-dynamo/snapshot/issues/936) | open, `approved`, `feature`; a maintainer agreed with the approach and asked to align the sandbox choice with kubelet (the newest sandbox, its IP only when it is ready); assignment requested |
+| 3 | [#938](https://github.com/ai-dynamo/snapshot/issues/938) | open, `feature`; upstream plans CRIU compression of its own and asked for numbers with driver 615 and CustomStorage |
+| 4 | [#937](https://github.com/ai-dynamo/snapshot/issues/937) | open, `enhancement`; under discussion whether the NRI plugin and the restore proxy get separate controls |
+| 5 | [#935](https://github.com/ai-dynamo/snapshot/issues/935) | open, not labelled; a maintainer would rather extend one PodSnapshot to several containers than capture with several PodSnapshots, and asked to reframe the issue as that feature |
+| 6 | [#941](https://github.com/ai-dynamo/snapshot/issues/941) | open, `enhancement`; no maintainer reply yet |
 
 ## Releases
 
@@ -139,7 +150,7 @@ Commit `c297601a` `feat(restore): restore one Pod's containers from several PodS
   #811, #913, #934 (`podcontract`, NRI plugin), #893, #892 (NRI plugin) and
   #174, #906 (`protocol.go`) touch the same files.
 - **Status**: fork only. A new annotation is a public API: it needs an
-  approved issue, likely a SNEP.
+  approved issue, likely a SNEP. Design issue [#942](https://github.com/ai-dynamo/snapshot/issues/942) is open.
 
 ## 2. Take the restore Pod's IP from its sandbox
 
@@ -180,7 +191,7 @@ Commit `81d92cfb` `feat(agent): take the restore Pod's IP from its sandbox befor
   needs the `restore_from_map.go` hunk dropped (it extends patch 1 to the new
   annotation). The open restore-retry stack (#901, #906) adds its own CRI read
   in `runtime.go`, `oci_containerd.go`, `oci_crio.go`.
-- **Status**: fork only.
+- **Status**: fork only. Issue [#936](https://github.com/ai-dynamo/snapshot/issues/936) is `approved`; no pull request yet.
 
 ## 3. LZ4 memory page compression and parallel decoding
 
@@ -223,7 +234,8 @@ Commit `c832346a` `feat(agent): compress memory pages with CRIU's LZ4 and decode
   `types/config_test.go`, `values.schema.json`) plus `docs/reference/api.md`,
   whose values table moved to `docs/reference/helm-values.md`. Open PRs #801,
   #896, #906, #912, #838 touch the same files.
-- **Status**: fork only. New configuration fields need an approved issue.
+- **Status**: fork only. New configuration fields need an approved issue:
+  [#938](https://github.com/ai-dynamo/snapshot/issues/938) is open, not yet `approved`.
 
 ## 4. Chart: `daemonset.restoreProxy.enabled`
 
@@ -249,7 +261,7 @@ Commit `cd86f4d3` `feat(chart): let an install keep the agent out of container c
   example one about the NRI plugin rather than the restore proxy).
 - **Against upstream main**: applies cleanly (only `CHANGELOG.md` conflicts,
   from the patches before it).
-- **Status**: fork only.
+- **Status**: fork only. Issue [#937](https://github.com/ai-dynamo/snapshot/issues/937) is open, not yet `approved`.
 
 ## 5. Capture a Pod's containers one after the other
 
@@ -274,7 +286,8 @@ Commit `efa13477` `fix(agent): let a pod's containers be captured one after the 
   (one capture per source Pod at a time), #822 (retry a failed capture).
 - **Against upstream main**: applies cleanly on its own and on top of the
   others; its tests pass there. No open PR conflicts with it.
-- **Status**: fork only. A bug fix: the easiest to take upstream.
+- **Status**: fork only. A bug fix: the easiest to take upstream. Issue
+  [#935](https://github.com/ai-dynamo/snapshot/issues/935) is open; upstream may want multi-container PodSnapshots instead.
 
 ## 6. End a restore that will not run
 
@@ -326,7 +339,7 @@ Commit `dfcf8c2e` `fix(agent): end a restore that will not run instead of leavin
   `docs/troubleshooting/restores.md`). Open PRs #896, #906 (`config.go`, chart
   values) and #174 (`compat.go`) touch the same code.
 - **Status**: fork only. Changes restore semantics: needs an approved issue
-  and agreement with the SNEP-322/SNEP-247 authors.
+  and agreement with the SNEP-322/SNEP-247 authors. Issue [#941](https://github.com/ai-dynamo/snapshot/issues/941) is open.
 
 ## 7. Own condition reasons for restores that did not run
 
@@ -748,7 +761,8 @@ bump. Main has 18 commits that `v0.3.0` lacks, and there is no newer release
 ## Suggested order for upstream pull requests
 
 Small, self-contained fixes first; new API and changed semantics last, after
-the related designs settle.
+the related designs settle. The issues for patches 1 to 6 are open (see the
+table at the top); only [#936](https://github.com/ai-dynamo/snapshot/issues/936) (patch 2) is `approved` so far.
 
 1. **Patch 5** (capture one after the other): a bug fix, applies cleanly, no
    open PR in the way. Open a bug issue, wait for `approved`, then the PR.
