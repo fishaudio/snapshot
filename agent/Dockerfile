@@ -29,12 +29,15 @@ ARG GO_IMAGE_DIGEST=sha256:6928d94d1142af58816fed5a62338d605a266ccd53a0deaab6b10
 # stage, which is a developer target (`--target linter`) and so is not covered
 # by the CI `check` job.
 ARG GOLANGCI_LINT_VERSION=v2.14.0
-# Default to upstream CRIU development branch. Custom forks can override both
-# args at build time, for example:
+# Default to the upstream CRIU development branch commit that the LZ4 page
+# compression was verified on, which the patches in criu-patches/ are made
+# against. Custom forks can override both args at build time, for example:
 #   --build-arg CRIU_REPO=<git-remote-url>
 #   --build-arg CRIU_REF=<fork-branch-or-sha>
+# The patches are applied to whatever ref is built, and a patch that does not
+# apply fails the build.
 ARG CRIU_REPO=https://github.com/checkpoint-restore/criu.git
-ARG CRIU_REF=criu-dev
+ARG CRIU_REF=b64199c850c22a55ce82ac81253dd9bca578acb0
 ARG CUDA_HEADERS_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04@sha256:843a5e81ed49ad2a2787aa10e48e926dc1f9440522a122ec2a637c27039fc77d
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04@sha256:8315e2455736c4f9b597f15c5fb4d31f834e798e0c6b66bbdbdbac491ce26bd1
 
@@ -234,11 +237,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     uuid-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Changes to CRIU that this repository carries until CRIU has them, applied in
+# file name order. KAMIN-PATCHES.md lists them.
+COPY criu-patches/ /tmp/criu-patches/
 RUN git init /tmp/criu \
     && cd /tmp/criu \
     && git remote add origin ${CRIU_REPO} \
     && git fetch --depth 1 origin ${CRIU_REF} \
     && git checkout FETCH_HEAD \
+    && for patch in /tmp/criu-patches/*.patch; do \
+         git apply --verbose "${patch}" || exit 1; \
+       done \
     && make -j${BUILD_JOBS} \
     && make DESTDIR=/criu-install install-criu install-lib install-cuda_plugin
 
@@ -249,8 +258,8 @@ RUN mkdir -p /criu-install/usr/local/lib/snapshot/criu-plugins \
       -o /criu-install/usr/local/lib/snapshot/criu-plugins/snapshot_inet_remap.so \
       /tmp/snapshot_inet_remap.c
 
-# CRIU source at the exact ref built from: this is a from-source build, and
-# CRIU_REF may be a moving branch.
+# CRIU source at the exact ref built from, with the patches applied: this is a
+# from-source build, and CRIU_REF may be a moving branch.
 RUN tar -czf /criu-src.tar.gz -C /tmp --exclude-vcs criu
 
 # =============================================================================

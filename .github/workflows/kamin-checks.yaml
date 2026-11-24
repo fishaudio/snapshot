@@ -1,0 +1,106 @@
+# Fork-only: checks for pull requests to the fork's kamin/* branches, and for
+# kamin/main itself. Upstream's ci.yml runs only for main and release branches,
+# so without this a change to kamin/main would reach a release with no unit
+# test run.
+#
+#   Go unit tests   make test and make build, as ci.yml's test and build jobs,
+#                   plus gofmt
+#   CRIU patches    builds CRIU at the agent image's CRIU_REF without the
+#                   patches in agent/criu-patches/, and with them through the
+#                   agent Dockerfile's own CRIU stage, then dumps and restores
+#                   with both (.github/kamin/criu-link-remap-test.sh)
+#
+# KAMIN-PATCHES.md lists the fork's patches.
+name: kamin checks
+
+on:
+  pull_request:
+    branches: ['kamin/**']
+  push:
+    branches: [kamin/main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kamin-checks-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          cache: true
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l api agent operator)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::not gofmt-formatted: ${unformatted}"
+            exit 1
+          fi
+      - run: make test
+      - run: make build
+
+  criu-patches:
+    name: CRIU patches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The agent Dockerfile's CRIU build dependencies; their libraries also
+      # run the CRIU that the Dockerfile builds.
+      - name: Install CRIU's build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libbsd-dev libcap-dev libnet1-dev \
+            libnl-3-dev libnl-route-3-dev liblz4-dev libprotobuf-dev \
+            libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3 \
+            python3-protobuf libgnutls28-dev libnftables-dev uuid-dev shellcheck
+
+      - name: Shellcheck the test
+        run: shellcheck .github/kamin/criu-link-remap-test.sh
+
+      - name: Build CRIU without the patches
+        run: |
+          set -euo pipefail
+          repo="$(sed -n 's/^ARG CRIU_REPO=//p' agent/Dockerfile)"
+          ref="$(sed -n 's/^ARG CRIU_REF=//p' agent/Dockerfile)"
+          echo "CRIU ${repo} ${ref}" | tee -a "$GITHUB_STEP_SUMMARY"
+          git init -q "${RUNNER_TEMP}/criu-src"
+          cd "${RUNNER_TEMP}/criu-src"
+          git remote add origin "${repo}"
+          git fetch -q --depth 1 origin "${ref}"
+          git checkout -q FETCH_HEAD
+          make -j"$(nproc)" criu
+          cp criu/criu "${RUNNER_TEMP}/criu-base"
+
+      # The very build the agent image ships: its CRIU stage applies the
+      # patches, and fails if one does not apply.
+      - name: Build CRIU with the patches, as the agent image does
+        run: |
+          set -euo pipefail
+          docker build --target criu-builder -t kamin-criu-builder -f agent/Dockerfile agent/
+          id="$(docker create kamin-criu-builder)"
+          docker cp "${id}:/criu-install/usr/local/sbin/criu" "${RUNNER_TEMP}/criu-patched"
+          docker rm "${id}"
+
+      - name: Dump and restore across link remap names
+        run: sudo .github/kamin/criu-link-remap-test.sh "${RUNNER_TEMP}/criu-base" "${RUNNER_TEMP}/criu-patched"

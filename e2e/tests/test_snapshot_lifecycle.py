@@ -1473,10 +1473,13 @@ def assert_recorded_environment(
         "cpuFeatures": features,
     }
     # Exact equality, because the CPU limit this pod never set must stay
-    # absent here as well as in the manifest.
+    # absent here as well as in the manifest. Every checkpoint records the
+    # target container's environment and arguments, for the restore inputs
+    # check, and lists the kinds it recorded.
     expected_pod = {
         "image": container.image,
         "memory": limits["memory"],
+        "recordedInputs": ["Env", "Args"],
     }
     if source_image_id:
         expected_pod["imageDigest"] = source_image_id.split("://")[-1].rsplit("@", 1)[-1]

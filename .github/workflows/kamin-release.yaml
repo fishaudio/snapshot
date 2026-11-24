@@ -29,8 +29,6 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io/${{ github.repository }}
-  # The criu-dev commit the LZ4 page compression was verified on.
-  CRIU_REF: b64199c850c22a55ce82ac81253dd9bca578acb0
   # As hack/tools.mk.
   HELM_VERSION: v3.17.3
 
@@ -163,7 +161,6 @@ jobs:
             TAGS="${tag}" \
             AGENT_PLATFORM=linux/amd64 \
             DOCKER_BUILD_ARGS="--push --provenance=false --metadata-file=buildx.json \
-              --build-arg CRIU_REF=${CRIU_REF} \
               --cache-from type=registry,ref=${cache} \
               --cache-to type=registry,ref=${cache},mode=max"
           digest="$(jq -er '."containerimage.digest"' buildx.json)"

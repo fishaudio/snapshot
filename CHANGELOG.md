@@ -241,6 +241,13 @@ commit-level history for each release is on its
   because the container the first capture dumped has exited non-zero: the
   dump ends its target. A container whose own capture failed still fails
   the next capture.
+- A capture no longer fails with `Can't link remap to /dev/shm/sem.…: File
+  exists` when another container of the same Pod, sharing its `/dev/shm`, was
+  captured before it or at the same time and both hold a POSIX named
+  semaphore. The agent image's CRIU now gives the hard link it keeps to such a
+  file another name when the first one is taken. Restores are unchanged:
+  snapshots taken before the upgrade restore as before, and snapshots taken
+  after it also restore with an older agent.
 
 ### Deprecated
 

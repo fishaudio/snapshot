@@ -1,0 +1,101 @@
+From 142d9a5041eafbccfc9e2ecee4470d4154154a6c Mon Sep 17 00:00:00 2001
+From: Kilerd Chan <blove694@gmail.com>
+Date: Tue, 24 Nov 2026 21:47:39 +0900
+Subject: [PATCH] files-reg: try another link remap name when the name is taken
+
+A linked remap is a hard link named link_remap.<id> in the directory of
+the removed file, and <id> is the next file id of the dump. Two dumps of
+near-identical process trees count the same ids, so when their tasks
+share a directory they pick the same names. Two containers that share
+/dev/shm, each running a process that maps a POSIX named semaphore
+created with sem_open(3) (glibc creates it under a temporary name, links
+it to its final name and removes the temporary one), are such a pair: the
+dump that links second fails with
+
+  Error (criu/files-reg.c): Can't link remap to /dev/shm/sem.XXXXXX: File exists
+
+and the dump aborts. The dumps need not even overlap: a dump that kills
+its tasks keeps its link remaps, so a later dump in the same directory
+finds the name taken as well.
+
+Any free name does: restore takes the remap's name from the image
+(RegFileEntry.name) and never derives it from the id. On EEXIST, try
+link_remap.<id>.1, .2 and so on, up to 64 more names, in whatever
+directory the link ends up in. The first name is unchanged, so a dump
+that finds it free writes the same images as before, and restore is not
+touched: images written before and after this change restore with either
+version.
+
+Signed-off-by: Kilerd Chan <blove694@gmail.com>
+---
+ criu/files-reg.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index 78d0c12..72baa39 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -1110,6 +1110,40 @@ static void check_overlayfs_fallback(char *path, const struct fd_parms *parms, b
+ 	*fallback = true;
+ }
+ 
++/*
++ * How many other names create_link_remap() tries when the first one is
++ * taken. Each try costs one linkat().
++ */
++#define LINK_REMAP_NAME_ATTEMPTS 64
++
++/*
++ * Rename the link remap at the end of link_name to link_remap.<id>.<attempt>.
++ *
++ * Link remap names come from the file ids of one dump, so a dump whose tasks
++ * share a directory with the tasks of another dump picks the names the other
++ * one picks: two containers that share /dev/shm and run near-identical process
++ * trees, dumped at the same time, both link their deleted POSIX semaphore to
++ * the same link_remap.<id>. A dump that kills its tasks also leaves its link
++ * remaps behind, so a later dump in the same directory can find the name
++ * taken too. Any free name works: restore reads the name from the image.
++ */
++static int next_link_remap_name(char *link_name, u32 id, unsigned int attempt)
++{
++	char *slash = strrchr(link_name, '/');
++	size_t room;
++	int ret;
++
++	BUG_ON(!slash);
++	room = PATH_MAX - (size_t)(slash + 1 - link_name);
++	ret = snprintf(slash + 1, room, "link_remap.%d.%u", id, attempt);
++	if (ret < 0 || (size_t)ret >= room) {
++		pr_err("No room for another link remap name in %s\n", link_name);
++		return -1;
++	}
++
++	return 0;
++}
++
+ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_id *nsid, const struct fd_parms *parms,
+ 			     bool *fallback)
+ {
+@@ -1119,6 +1153,7 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
+ 	FownEntry fwn = FOWN_ENTRY__INIT;
+ 	int mntns_root;
+ 	const struct stat *ost = &parms->stat;
++	unsigned int attempt = 0;
+ 
+ 	if (!opts.link_remap_ok) {
+ 		pr_err("Can't create link remap for %s. "
+@@ -1157,6 +1192,14 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
+ 	mntns_root = mntns_get_root_fd(nsid);
+ 
+ 	while (linkat_hard(lfd, "", mntns_root, link_name, ost->st_uid, ost->st_gid, AT_EMPTY_PATH) < 0) {
++		if (errno == EEXIST && attempt < LINK_REMAP_NAME_ATTEMPTS) {
++			/* The name is taken, see next_link_remap_name(). */
++			if (next_link_remap_name(link_name, rfe.id, ++attempt))
++				return -1;
++			pr_info("Link remap name taken, trying %s\n", link_name);
++			continue;
++		}
++
+ 		if (errno != ENOENT) {
+ 			pr_perror("Can't link remap to %s", path);
+ 			return -1;
