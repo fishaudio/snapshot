@@ -4,7 +4,7 @@
 `v0.3.0` plus patches 1–6 below, one commit each, in this order, then one
 `ci(kamin)` commit (`.github/workflows/kamin-release.yaml`,
 `.github/kamin/package-chart.sh`) and this file, then patches 7 and 8 (with
-patch 8's joint race test), patch 9 and patch 10. Patch 10 adds the changes
+patch 8's joint race test), patches 9, 10 and 11. Patch 10 adds the changes
 to CRIU that the agent image carries (`agent/criu-patches/`) and the fork's
 own pull request checks (`.github/workflows/kamin-checks.yaml`). Nothing else
 differs from upstream. Every patch is meant to go upstream, the CRIU patches
@@ -24,6 +24,7 @@ Status as of 2026-11-24.
 | 8 | `41161579`, `df4f9e29`, `7b37a543` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
 | 9 | `0ff9210b` | restore only into a container started with the snapshot's inputs (`nvidia.com/restore-match-inputs`, `RestoreInputsChanged`) | not covered; reason may collide with the restore-retry stack (#899, #902) |
 | 10 | `0fc5cb7c` | build CRIU with a patch that picks another link remap name when the name is taken, so containers of one Pod that share `/dev/shm` can be captured | CRIU: not covered; Snapshot: not covered |
+| 11 | `9b6dc90e` | give a source Pod to one capture at a time, so that its containers are captured in turn | not covered; same code as upstream main |
 
 None of the patches has an upstream issue or pull request yet.
 
@@ -263,7 +264,8 @@ Commit `efa13477` `fix(agent): let a pod's containers be captured one after the 
   A container whose capture failed is not skipped, so a crash still fails the
   next capture.
 - **Why**: a Pod can be the source of several PodSnapshots, one container
-  each. Work orders on one Pod already run one at a time, but the second one
+  each. Work orders on one Pod already run one at a time (they were meant to;
+  patch 11 makes them), but the second one
   failed at once: the container the first dump ended had exited 137, which the
   sweep read as a crashed checkpoint container, and it then killed every
   container left running, including the one about to be captured.
@@ -792,6 +794,62 @@ Commit `0fc5cb7c` `fix(agent): build CRIU with a patch that picks another link r
   fork-only and goes once a CRIU release has the fix.
 - **Status**: fork only.
 
+## 11. Give a source Pod to one capture at a time
+
+Commit `9b6dc90e` `fix(agent): give a source pod to one capture at a time`.
+
+- **What**: the agent records, per source Pod UID, the work order
+  (PodSnapshotContent) that owns the Pod's captures (`captureClaims`). A work
+  order takes a free claim only when the informer cache names it the owner
+  (`chooseActiveContent`: oldest by creation timestamp, then by name, as
+  before) and keeps it across passes, including those that wait for the
+  container to be ready. Another work order may take the claim over only when
+  the cache shows the owner done (Ready, Failed, being deleted, or gone) and
+  no pass of the owner is running. The pass that finds its work order done
+  drops the claim and queues the Pod's other work orders, and the content
+  informer now also queues a deleted work order, whose last reconcile does
+  that. Claims live in the agent's memory.
+- **Why**: each work order runs on its own queue key, so two of one Pod
+  reconcile at once, and only the owner may touch the live Pod (the crash
+  sweep kills its containers, the dump ends its target). The owner was
+  recomputed on every pass from each worker's view of the cache and recorded
+  nowhere. A work order that began while it was the only one cached went on to
+  dump; a sibling created in the same second (timestamps have one-second
+  resolution) whose name sorted first then chose itself, and the two
+  containers were dumped at once. Their dumps then collide on what the
+  containers share, such as `/dev/shm` (patch 10), and a sibling's dump can
+  read as a crash to the other's sweep. Whether it happened was a coin flip
+  of two random names per Pod.
+- **Order and the crash sweep**: the cache still decides which work order
+  goes first. The claim only stops that choice from changing once a capture
+  has begun, and the next capture starts only once the previous one's outcome
+  is in the cache, which is what its crash sweep (patch 5) reads to tell the
+  previous capture's exit from a crash. A work order deleted during its dump
+  keeps the Pod until the dump returns.
+- **In memory**: the agent is the only one that captures on its node (one per
+  node, `spec.source.nodeName`), and after a restart its workers start only
+  once the cache is synced, so they all see the same owner. Nothing is written
+  to the API, so there is nothing to clean up or to go stale.
+- **Files**: `agent/internal/controller/{capture_claim,podsnapshotcontent,controller}.go`,
+  `CHANGELOG.md`.
+- **Tests**: `capture_claim_test.go`: a free claim goes to the work order the
+  cache names, and the owner keeps it whatever the cache names later; a
+  sibling the cache names after the owner began waits, also between the
+  owner's passes; no hand-over while a pass of the owner runs, even when the
+  owner is deleted, or while the cache does not show it done; a running claim
+  is not dropped; claims are per Pod; 50 rounds of 8 concurrent claimants with
+  disagreeing caches, exactly one winner each. Through `reconcileCapture`: the
+  race itself (the first work order dumps while only it is cached, the second,
+  sorting first, arrives in the same second and waits for the dump and then
+  for the first one's Ready to reach the cache, then is queued and captured);
+  an owner deleted during its dump; two work orders captured in turn when the
+  caches agree. Existing ownership tests are unchanged.
+- **Upstream**: not covered: `chooseActiveContent` and `captureOwnerForPod`
+  are the same on upstream main (#385 is the one-capture-per-Pod issue), so
+  the code it changes is there too.
+- **Status**: fork only. A bug fix with no API change: easy to take upstream
+  after patch 5.
+
 ## How far upstream has moved
 
 As of 2026-11-15 upstream main is at `94b6fa2a` (2026-11-13). `v0.3.0` is on
@@ -847,6 +905,9 @@ the related designs settle.
 8. **Patch 9** (restore inputs): after patches 6 to 8. A new annotation, a new
    manifest section, a status field and a reason; open an enhancement issue
    with the Secret-rotation case first.
+
+Patch 11 (one capture per Pod at a time) can go with patch 5, or right after
+it: a bug fix with no API change.
 
 Patch 10's CRIU patch goes to [checkpoint-restore/criu](https://github.com/checkpoint-restore/criu)
 on its own, with a zdtm test, whenever it is ready; nothing here depends on
