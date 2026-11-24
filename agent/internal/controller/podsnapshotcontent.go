@@ -84,6 +84,8 @@ func (w *NodeController) reconcileCapture(ctx context.Context, name string) erro
 	if content == nil || content.Spec.Source.NodeName != w.config.NodeName ||
 		!content.DeletionTimestamp.IsZero() || isContentTerminal(content) {
 		w.checkpointGates.Delete(name)
+		// Done in the cache, so the source pod passes to its next work order.
+		w.finishCapture(name)
 		return nil
 	}
 
@@ -137,15 +139,17 @@ func (w *NodeController) reconcileCapture(ctx context.Context, name string) erro
 	// Several work orders can name one pod, and everything below draws conclusions from live pod
 	// state — including a sweep that SIGKILLs its containers. Only the owner may. A non-owner
 	// reading the source mid-dump would kill the container the owner is dumping, so it waits:
-	// ownership passes when the owner goes terminal.
+	// ownership passes when the cache shows the owner done and no pass of it runs (captureClaims).
 	chosen, err := w.captureOwnerForPod(pod)
 	if err != nil {
 		return err
 	}
-	if chosen != content.Name {
-		logger.V(1).Info("Another work order owns this source pod", "pod", pod.Name, "owner", chosen)
+	owner, release := w.captureClaims.claim(pod, content.Name, chosen, w.captureFinished)
+	if release == nil {
+		logger.V(1).Info("Another work order owns this source pod", "pod", pod.Name, "owner", owner)
 		return nil
 	}
+	defer release()
 
 	if handled, err := w.failCheckpointOnContainerExit(ctx, content, pod); handled {
 		return err
