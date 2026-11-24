@@ -93,6 +93,8 @@ type NodeController struct {
 	// checkpointGates holds a *checkpointGate per work order, while the agent waits for its
 	// source container to be ready for the checkpoint.
 	checkpointGates sync.Map
+	// captureClaims records which work order owns each source pod's captures.
+	captureClaims captureClaims
 	// hookExec runs a lifecycle hook's file action in its container, and
 	// hookHTTP sends its HTTP requests. Tests replace them.
 	hookExec lifecyclehooks.Execer
@@ -407,11 +409,13 @@ func (w *NodeController) Run(ctx context.Context) error {
 	w.contentIndexer = contentInformer.GetIndexer()
 	// Handlers only enqueue: reconciling inline would block delivery for the length of a dump.
 	// The resync re-enqueues everything, which is the backstop for a not-yet-quiesced source.
+	// A deleted work order is reconciled once more, which hands its source pod to the next one.
 	if _, err := contentInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: w.enqueueContent,
 		UpdateFunc: func(_, newObj interface{}) {
 			w.enqueueContent(newObj)
 		},
+		DeleteFunc: w.enqueueContent,
 	}); err != nil {
 		return fmt.Errorf("failed to add snapshot-content informer handler: %w", err)
 	}

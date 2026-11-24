@@ -241,6 +241,12 @@ commit-level history for each release is on its
   because the container the first capture dumped has exited non-zero: the
   dump ends its target. A container whose own capture failed still fails
   the next capture.
+- The captures of one Pod's containers, one `PodSnapshot` each, now run one
+  at a time, as documented. The node agent hands the Pod to the first capture
+  that the oldest-first order chooses and keeps it there until that capture's
+  outcome is recorded; the next one starts only then. Before, a capture
+  created in the same second whose name sorted first could start while the
+  other was dumping, and the two could fail each other.
 - A capture no longer fails with `Can't link remap to /dev/shm/sem.…: File
   exists` when another container of the same Pod, sharing its `/dev/shm`, was
   captured before it or at the same time and both hold a POSIX named
