@@ -4,11 +4,13 @@
 `v0.3.0` plus patches 1–6 below, one commit each, in this order, then one
 `ci(kamin)` commit (`.github/workflows/kamin-release.yaml`,
 `.github/kamin/package-chart.sh`) and this file, then patches 7 and 8 (with
-patch 8's joint race test). Patch 9 follows on the branch `kamin/restore-inputs` until it is merged into
-`kamin/main`. Nothing else differs from upstream. Every patch is meant to go
-upstream; the fork exists until they are merged there.
+patch 8's joint race test), patch 9 and patch 10. Patch 10 adds the changes
+to CRIU that the agent image carries (`agent/criu-patches/`) and the fork's
+own pull request checks (`.github/workflows/kamin-checks.yaml`). Nothing else
+differs from upstream. Every patch is meant to go upstream, the CRIU patches
+to CRIU; the fork exists until they are merged there.
 
-Status as of 2026-11-16.
+Status as of 2026-11-24.
 
 | # | Commit | Change | Upstream |
 |---|--------|--------|----------|
@@ -21,6 +23,7 @@ Status as of 2026-11-16.
 | 7 | `3038962f` | own condition reasons for restores that did not run (`RestoreSnapshotNotReady`, `RestoreEndedByWorkload`) | not covered; reasons may collide with the restore-retry stack (#899, #902) |
 | 8 | `41161579`, `df4f9e29`, `7b37a543` | claim a destination container (`restore-claim`) before restoring into it or ending it | not covered; conflicts with SNEP-883 (#884), touches SNEP-247 (#836) and SNEP-322 (#800) |
 | 9 | `0ff9210b` | restore only into a container started with the snapshot's inputs (`nvidia.com/restore-match-inputs`, `RestoreInputsChanged`) | not covered; reason may collide with the restore-retry stack (#899, #902) |
+| 10 | `0fc5cb7c` | build CRIU with a patch that picks another link remap name when the name is taken, so containers of one Pod that share `/dev/shm` can be captured | CRIU: not covered; Snapshot: not covered |
 
 None of the patches has an upstream issue or pull request yet.
 
@@ -710,7 +713,10 @@ Commit `0ff9210b` `feat(agent): restore only into a container started with the s
   `recordedInputs` published only for a readable record),
   `controller/checkpointsource_test.go` (each field of
   `CheckpointSourcePod`, set alone, publishes the block: the emptiness test
-  goes through reflection, not a list of fields).
+  goes through reflection, not a list of fields). The CPU e2e test of the
+  recorded environment (`test_snapshot_lifecycle.py`) expects
+  `recordedInputs` in `status.source.pod` since `f50ad234`; before, it failed
+  on every run.
 - **Upstream**: not covered. The annotation and the record are opt-in and
   additive, and upstream restore Pods built by `podcontract.Build` copy the
   source's environment, so they have the same hazard. The new reason would
@@ -721,6 +727,70 @@ Commit `0ff9210b` `feat(agent): restore only into a container started with the s
 - **Status**: fork only. Kamin writes the annotation from its webhook; roll the
   agent out before the webhook, since an agent without this patch ignores the
   annotation and restores without the check.
+
+## 10. Pick another link remap name when the name is taken
+
+Commit `0fc5cb7c` `fix(agent): build CRIU with a patch that picks another link remap name when the name is taken`.
+
+- **What**: the agent image's CRIU stage applies the patches in
+  `agent/criu-patches/` to `CRIU_REF`, in file name order, and fails the build
+  if one does not apply. `CRIU_REF` defaults, in `agent/Dockerfile`, to the
+  `criu-dev` commit the fork releases (`b64199c8`, the one the LZ4 page
+  compression of patch 3 was verified on); `kamin-release.yaml` no longer
+  passes its own copy, so the Dockerfile is the one place it is set. The one
+  patch, `0001-files-reg-try-another-link-remap-name-when-the-name-is-taken.patch`:
+  CRIU saves a mapped or open file whose name was removed while another name
+  for it remains as a link remap, a hard link `link_remap.<id>` in the file's
+  directory. When that name is taken (`EEXIST`), CRIU now tries
+  `link_remap.<id>.1`, `.2` and so on, up to 64 more names, where it failed the
+  dump before. The first name is unchanged.
+- **Why**: `<id>` is counted per dump, so two dumps of near-identical process
+  trees pick the same names. The containers of one Pod share `/dev/shm`
+  (containerd binds the sandbox's into each container unless the Pod mounts
+  its own), and a process that maps a POSIX named semaphore made by
+  `sem_open(3)` maps such a file: glibc creates the semaphore under a
+  temporary name, links it to its final name and removes the temporary one.
+  Python's multiprocessing locks are such semaphores. The dump of the second
+  of two such containers then fails with `Can't link remap to
+  /dev/shm/sem.XXXXXX: File exists`, and the capture with it. The dumps need
+  not overlap: a dump that kills its tasks, as the agent's do
+  (`LeaveRunning=false`), keeps its link remaps, so the capture of the Pod's
+  next container finds the name taken as well. Whether the two containers'
+  ids collide depends on every file and mapping each process tree holds, so
+  any image, model or flag change can make the next capture of such a Pod
+  fail.
+- **Snapshots before and after**: restore reads a link remap's name from the
+  image (the remap's `RegFileEntry.name`), opens it, and removes it once the
+  restore is done; it never derives the name from the id, and the patch does
+  not touch restore. A dump whose first name is free writes the same images as
+  before. So snapshots taken before the patch restore with it, snapshots taken
+  with it restore with an agent without it (a rollback), and their keys and
+  contents are otherwise unchanged. The test below restores across both
+  directions.
+- **Files**: `agent/criu-patches/0001-files-reg-try-another-link-remap-name-when-the-name-is-taken.patch`,
+  `agent/Dockerfile`, `.github/workflows/{kamin-checks,kamin-release}.yaml`,
+  `.github/kamin/criu-link-remap-{test.sh,holder.c}`, `CHANGELOG.md`.
+- **Tests**: `.github/kamin/criu-link-remap-test.sh`, run as root by the
+  `kamin checks` workflow. It builds CRIU at `CRIU_REF` without the patches,
+  takes the patched CRIU from the agent Dockerfile's own CRIU stage, and dumps
+  and restores processes that hold such a semaphore
+  (`criu-link-remap-holder.c`) in the runner's `/dev/shm`: an image dumped
+  without the patch restores with it; with every first name taken, the dump
+  without the patch fails with `File exists` and the one with it takes
+  `link_remap.<id>.1`, and that image restores with and without the patch;
+  with the patch, two identical processes dumped one after the other, and
+  three pairs dumped at the same time, all succeed and restore. Every restored
+  process must map its own semaphore's inode, and the restore must remove its
+  link remap. The workflow also runs `make test`, `make build` and gofmt on
+  every pull request to a `kamin/*` branch and on `kamin/main`, which nothing
+  did before.
+- **Upstream**: CRIU: not covered; `create_link_remap` in `criu/files-reg.c`
+  names the link after the id alone ("Any 'unique' name works here actually"),
+  and the patch applies to `criu-dev` as of 2026-11-24. To send it, add a zdtm
+  test (a link remap whose name is taken). Snapshot: not covered; upstream
+  builds `criu-dev` and fails the same way. The Dockerfile's patch step is
+  fork-only and goes once a CRIU release has the fix.
+- **Status**: fork only.
 
 ## How far upstream has moved
 
@@ -777,6 +847,11 @@ the related designs settle.
 8. **Patch 9** (restore inputs): after patches 6 to 8. A new annotation, a new
    manifest section, a status field and a reason; open an enhancement issue
    with the Secret-rotation case first.
+
+Patch 10's CRIU patch goes to [checkpoint-restore/criu](https://github.com/checkpoint-restore/criu)
+on its own, with a zdtm test, whenever it is ready; nothing here depends on
+its order. Once a CRIU release has it, drop the patch and, if no other is
+left, the Dockerfile's patch step.
 
 ## Contributing upstream
 
